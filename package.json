@@ -5,12 +5,13 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test.js",
-    "setup": "node setup.js",
-    "demo": "node demo.js",
+    "start": "node bot.js",
     "bot": "node bot.js",
-    "seed": "node seed_persona.js"
-    "engines": { "node": ">=20" }
+    "setup": "node setup.js",
+    "seed": "node seed_persona.js",
+    "demo": "node demo.js",
+    "test": "node test.js"
+    "engines": { "node": ">=18" }
 
   },
   "keywords": [],
