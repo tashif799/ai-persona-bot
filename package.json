@@ -1,0 +1,25 @@
+{
+  "name": "ai-persona-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "setup": "node setup.js",
+    "demo": "node demo.js",
+    "bot": "node bot.js",
+    "seed": "node seed_persona.js"
+    "engines": { "node": ">=20" }
+
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.15.0",
+    "dotenv": "^17.2.2",
+    "openai": "^4.0.0",
+    "pg": "^8.16.3"
+  }
+}
