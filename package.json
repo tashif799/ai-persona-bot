@@ -11,8 +11,6 @@
     "seed": "node seed_persona.js",
     "demo": "node demo.js",
     "test": "node test.js"
-    "engines": { "node": ">=18" }
-
   },
   "keywords": [],
   "author": "",
@@ -22,5 +20,8 @@
     "dotenv": "^17.2.2",
     "openai": "^4.0.0",
     "pg": "^8.16.3"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
