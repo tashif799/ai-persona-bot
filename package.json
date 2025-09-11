@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "description": "",
+  "private": true,
   "main": "index.js",
   "scripts": {
     "start": "node bot.js",
@@ -11,20 +12,14 @@
     "seed": "node seed_persona.js",
     "demo": "node demo.js",
     "test": "node test.js"
-    "news": "node news_job.js"
-
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "discord.js": "^14.15.0",
     "dotenv": "^17.2.2",
     "openai": "^4.0.0",
-    "pg": "^8.16.3",
-    "rss-parser": "^3.13.0"
-  },
-  "engines": {
-    "node": "20.x"
+    "pg": "^8.16.3"
   }
 }
