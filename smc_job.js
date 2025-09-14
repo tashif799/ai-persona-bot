@@ -1,153 +1,189 @@
-// smc_job.js
+// smc_job.js  — HTML-capable SMC digest
 import 'dotenv/config';
 import OpenAI from 'openai';
 import pg from 'pg';
-import * as crypto from 'node:crypto';
-import fetch from 'node-fetch'; // Node 20 has fetch, but node-fetch is fine too; we'll not add it if not needed
+import fetch from 'node-fetch';
+import * as cheerio from 'cheerio';
 
-// ---------- config ----------
-const SMC_NEWS_URL = process.env.SMC_NEWS_URL || 'https://www.smc.edu/news/announcements/';
-const SMC_EVENTS_URL = process.env.SMC_EVENTS_URL || 'https://www.smc.edu/calendar/';
-const MAX_ITEMS = Number(process.env.SMC_MAX_ITEMS || 4);      // how many bullets to post
-const LOOKBACK_HOURS = Number(process.env.SMC_LOOKBACK_HOURS || 48);
+// -------- env --------
+const NEWS_URL   = process.env.SMC_NEWS_URL    || 'https://www.smc.edu/newsroom/';
+const EVENTS_URL = process.env.SMC_EVENTS_URL  || 'https://www.smc.edu/calendar/';
+const WEBHOOK    = process.env.SMC_WEBHOOK_URL || '';
+const MAX_ITEMS  = Number(process.env.SMC_MAX_ITEMS || 4);
+const LOOKBACK_H = Number(process.env.SMC_LOOKBACK_HOURS || 48);
 
-const WEBHOOK_URL = process.env.SMC_WEBHOOK_URL || process.env.NEWS_WEBHOOK_URL || '';
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
-const NEWS_CHANNEL_ID = process.env.NEWS_CHANNEL_ID || '';
+if (!WEBHOOK) throw new Error('SMC_WEBHOOK_URL is required');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// optional dedupe/log table (same db + ssl as your other jobs)
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }  // TLS for Neon/managed PG
+  ssl: { require: true, rejectUnauthorized: false }
 });
-
-
-// util
-const toUtc = d => new Date(d).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
-const hash = s => crypto.createHash('sha1').update(s).digest('hex');
 
 async function ensureTables() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS smc_post_log (
-      url_hash TEXT PRIMARY KEY,
-      url TEXT NOT NULL,
-      title TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS smc_digest_log (
+      id SERIAL PRIMARY KEY,
+      url TEXT UNIQUE,
+      title TEXT,
       posted_at TIMESTAMPTZ DEFAULT now()
-    )
+    );
   `);
 }
-
-async function alreadyPosted(url) {
-  const { rows } = await pool.query(`SELECT 1 FROM smc_post_log WHERE url_hash = $1`, [hash(url)]);
+async function seen(url) {
+  const { rows } = await pool.query(`SELECT 1 FROM smc_digest_log WHERE url=$1`, [url]);
   return rows.length > 0;
 }
-
-async function markPosted(url, title) {
+async function mark(url, title) {
   await pool.query(
-    `INSERT INTO smc_post_log (url_hash, url, title) VALUES ($1,$2,$3)
-     ON CONFLICT (url_hash) DO NOTHING`,
-    [hash(url), url, title]
+    `INSERT INTO smc_digest_log (url, title) VALUES ($1,$2) ON CONFLICT (url) DO NOTHING`,
+    [url, title]
   );
 }
 
-// simplistic HTML fetch + tiny parser helpers
-async function getHtml(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': 'smc-bot/1.0 (+discord)' } });
-  if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
+function withinHours(dateStr, hours) {
+  if (!dateStr) return true; // if no date on page, treat as maybe-new
+  const d = new Date(dateStr);
+  if (isNaN(d)) return true; // unknown format, don’t block
+  return (Date.now() - d.getTime()) <= hours * 3600 * 1000;
+}
+
+async function getHTML(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (SMC Bot)' }});
+  if (!res.ok) throw new Error(`Fetch failed ${res.status} ${url}`);
   return await res.text();
 }
 
-// Very light parse for Announcements index (looks for links under /news/announcements/)
-function parseAnnouncements(html) {
-  // crude but robust: find Announcement blocks as H2 + link to /news/announcements/...
-  const rx = /<h2[^>]*>\s*<a[^>]+href="([^"]*\/news\/announcements\/[^"]+)"[^>]*>(.*?)<\/a>\s*<\/h2>[\s\S]*?(\d{1,2}:\d{2}\s*p\.m\.|\d{1,2}:\d{2}\s*a\.m\.,\s*[A-Za-z]+\s*\d{1,2},\s*\d{4}|\b[A-Za-z]+\s*\d{1,2},\s*\d{4})/gi;
-  const out = [];
-  let m;
-  while ((m = rx.exec(html)) && out.length < MAX_ITEMS * 3) {
-    const link = new URL(m[1], 'https://www.smc.edu').toString();
-    const title = m[2].replace(/<[^>]+>/g, '').trim();
-    const when = (m[3] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-    out.push({ title, link, when });
-  }
+// ---- scrape newsroom (cards + lists) ----
+async function scrapeNewsroom() {
+  const html = await getHTML(NEWS_URL);
+  const $ = cheerio.load(html);
+  const items = [];
+
+  // try common patterns
+  $('a').each((_, a) => {
+    const href = $(a).attr('href') || '';
+    const title = $(a).text().trim();
+    if (!href || !title) return;
+
+    // keep only newsroom/article-ish links on smc.edu
+    const abs = href.startsWith('http') ? href : new URL(href, NEWS_URL).href;
+    if (!/smc\.edu/.test(abs)) return;
+    if (!/news|newsroom|press|article|story/i.test(abs)) return;
+
+    // try nearby date text (many SMC pages include dates in a sibling/parent)
+    let dateText = $(a).closest('article,li,div').find('time').attr('datetime')
+                 || $(a).closest('article,li,div').find('time').text()
+                 || $(a).closest('article,li,div').find('.date,.published').text()
+                 || '';
+
+    items.push({ source: 'SMC Newsroom', title, link: abs, dateText });
+  });
+
   // de-dupe by link
-  const seen = new Set(); const uniq = [];
-  for (const it of out) { if (!seen.has(it.link)) { seen.add(it.link); uniq.push(it); } }
-  return uniq;
+  const seenLinks = new Set();
+  const deduped = items.filter(it => {
+    if (seenLinks.has(it.link)) return false;
+    seenLinks.add(it.link);
+    return true;
+  });
+
+  // keep recent
+  return deduped.filter(it => withinHours(it.dateText, LOOKBACK_H));
 }
 
-// Fallback skim on the campus events hub (grab visible event cards quickly)
-function parseEvents(html) {
-  // Grab any anchor under /calendar/ that looks like an event card title
-  const rx = /<a[^>]+href="([^"]*\/calendar\/[^"#?]+)"[^>]*>([^<]{10,120})<\/a>/gi;
-  const out = [];
-  let m;
-  while ((m = rx.exec(html)) && out.length < MAX_ITEMS * 3) {
-    const link = new URL(m[1], 'https://www.smc.edu').toString();
-    const title = m[2].replace(/<[^>]+>/g, '').trim();
-    // ignore navigation or category links by filtering overly generic titles
-    if (!title || /Calendar|Visit|Search|Contact|Filter/i.test(title)) continue;
-    out.push({ title, link });
+// ---- scrape events (simple titles/links/date blobs) ----
+async function scrapeEvents() {
+  const html = await getHTML(EVENTS_URL);
+  const $ = cheerio.load(html);
+  const items = [];
+
+  // try generic “event card” selectors
+  $('[class*=event], .event, .event-item, .calendar__event, .events-list a').each((_, el) => {
+    const $el = $(el);
+    const a = $el.is('a') ? $el : $el.find('a').first();
+    const href = a.attr('href');
+    let title = a.text().trim();
+    if (!href || !title) return;
+
+    const abs = href.startsWith('http') ? href : new URL(href, EVENTS_URL).href;
+    // date text around card
+    const dateText = $el.find('time').attr('datetime')
+                   || $el.find('time').text()
+                   || $el.text();
+
+    items.push({ source: 'SMC Events', title, link: abs, dateText });
+  });
+
+  // also scan plain anchors as fallback
+  if (items.length === 0) {
+    $('a').each((_, a) => {
+      const href = $(a).attr('href') || '';
+      const title = $(a).text().trim();
+      if (!href || !title) return;
+      const abs = href.startsWith('http') ? href : new URL(href, EVENTS_URL).href;
+      if (/calendar|event|workshop|club|transfer|admission|application/i.test(abs)) {
+        items.push({ source: 'SMC Events', title, link: abs, dateText: '' });
+      }
+    });
   }
-  // de-dupe by link
-  const seen = new Set(); const uniq = [];
-  for (const it of out) { if (!seen.has(it.link)) { seen.add(it.link); uniq.push(it); } }
-  return uniq;
+
+  // de-dupe + filter recent
+  const seenLinks = new Set();
+  const deduped = items.filter(it => {
+    if (seenLinks.has(it.link)) return false;
+    seenLinks.add(it.link);
+    return true;
+  });
+
+  return deduped.filter(it => withinHours(it.dateText, LOOKBACK_H));
+}
+
+function makeDigestTitle() {
+  const nowUTC = new Date().toLocaleDateString('en-US', { timeZone: 'UTC' });
+  return `**SMC Updates — ${nowUTC} (UTC)**`;
 }
 
 async function summarize(items) {
   const pick = items.slice(0, MAX_ITEMS);
-  if (!pick.length) return [];
+  if (pick.length === 0) return [];
 
-  const lines = pick.map((it, i) =>
-    `(${i + 1}) ${it.title}\n${it.when ? `When: ${it.when}\n` : ''}Link: ${it.link}`
+  const lines = pick.map(
+    (it, i) => `(${i + 1}) ${it.title}\nSource: ${it.source}\nLink: ${it.link}`
   ).join('\n\n');
 
   const prompt = `
-You are an SMC campus update editor. Summarize each item in one short, precise line:
-- Start with a Markdown link: [Title](Link)
-- Then " — " and a crisp why-it-matters or key detail.
-- If a "When:" value exists, append " (When: <value>)".
-Keep it neutral, no hype. Only output the bullet list.
-Items:
+Summarize each item in one brief, helpful sentence for SMC students (what/where/when if present).
+Keep it neutral and practical. Output ONLY bullet points:
+
 ${lines}
 `.trim();
 
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
-    temperature: 0.3,
+    temperature: 0.4,
     max_tokens: 350,
     messages: [
-      { role: 'system', content: 'Only output a clean bullet list.' },
+      { role: 'system', content: 'You write concise campus bulletins for SMC students.' },
       { role: 'user', content: prompt }
     ]
   });
 
   const text = resp.choices?.[0]?.message?.content?.trim() || '';
-  return text.split('\n').filter(l => l.trim().startsWith('-'));
+  return text ? text.split('\n').filter(l => l.trim().startsWith('-')) 
+              : pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
 }
 
-async function postToDiscord(content) {
-  if (WEBHOOK_URL) {
-    const res = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content })
-    });
-    if (!res.ok) throw new Error(`Webhook failed: ${res.status} ${await res.text()}`);
-    return;
-  }
-  if (!DISCORD_TOKEN || !NEWS_CHANNEL_ID) {
-    throw new Error('Set SMC_WEBHOOK_URL (recommended) or both DISCORD_TOKEN and NEWS_CHANNEL_ID.');
-    }
-  const res = await fetch(`https://discord.com/api/v10/channels/${NEWS_CHANNEL_ID}/messages`, {
+async function postToDiscord(title, bullets) {
+  const content = `${title}\n${bullets.join('\n')}`;
+  const res = await fetch(WEBHOOK, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bot ${DISCORD_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content })
   });
-  if (!res.ok) throw new Error(`Discord API post failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Webhook post failed: ${res.status} ${await res.text()}`);
 }
 
 (async () => {
@@ -155,62 +191,36 @@ async function postToDiscord(content) {
   try {
     await ensureTables();
 
-    // 1) Pull Announcements
-    const annHtml = await getHtml(SMC_NEWS_URL);
-    let ann = parseAnnouncements(annHtml);
+    // scrape both
+    const [news, events] = await Promise.all([
+      scrapeNewsroom().catch(e => { console.log('Newsroom scrape error:', e.message); return []; }),
+      scrapeEvents().catch(e => { console.log('Events scrape error:', e.message); return []; })
+    ]);
 
-    // Filter out ones we already posted
-    ann = ann.filter(i => i.title && i.link);
-
-    // 2) Optionally peek the events hub for extra items (best-effort)
-    let events = [];
-    try {
-      const evHtml = await getHtml(SMC_EVENTS_URL);
-      events = parseEvents(evHtml);
-    } catch {}
-
-    // Merge, favor Announcements first
-    const combined = [...ann, ...events].slice(0, MAX_ITEMS);
-
-    // Remove links we’ve posted before
-    const newOnes = [];
-    for (const it of combined) {
-      if (!(await alreadyPosted(it.link))) {
-        newOnes.push(it);
-      }
+    // filter out links we've already posted (db)
+    const fresh = [];
+    for (const it of [...news, ...events]) {
+      if (!(await seen(it.link))) fresh.push(it);
     }
 
-    if (newOnes.length === 0) {
+    if (fresh.length === 0) {
       console.log('ℹ️ No new SMC items to post.');
       return;
     }
 
-    // Summarize to bullets
-    const bullets = await summarize(newOnes);
-    if (!bullets.length) {
-      console.log('ℹ️ Summarizer returned no bullets; skipping.');
-      return;
-    }
+    // summarize + post
+    const bullets = await summarize(fresh);
+    const finalBullets = bullets.slice(0, MAX_ITEMS);
+    await postToDiscord(makeDigestTitle(), finalBullets);
 
-    const today = new Date().toLocaleDateString('en-US', { timeZone: 'UTC' });
-    const header = `**SMC Updates — ${today} (UTC)**`;
-    const content = `${header}\n${bullets.join('\n')}`;
-
-    await postToDiscord(content);
-
-    // record
-    for (const it of newOnes) {
-      await markPosted(it.link, it.title);
-    }
-    console.log(`✅ Posted ${newOnes.length} SMC item(s).`);
+    // remember
+    for (const it of fresh.slice(0, MAX_ITEMS)) await mark(it.link, it.title);
+    console.log(`✅ Posted SMC digest with ${finalBullets.length} items.`);
   } catch (e) {
-    console.error('❌ smc_job failed:', e);
+    console.error('❌ SMC job failed:', e);
     process.exitCode = 1;
   } finally {
     client.release();
     await pool.end();
   }
 })();
-
-
-
