@@ -11,6 +11,7 @@
     "setup": "node setup.js",
     "seed": "node seed_persona.js",
     "demo": "node demo.js",
+    "smc": "node smc_job.js",
     "test": "node test.js"
   },
   "engines": {
