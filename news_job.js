@@ -7,16 +7,50 @@ import pg from 'pg';
 // ---------- config ----------
 const FEEDS = (process.env.NEWS_FEEDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const DEFAULT_FEEDS = [
-  'https://www.reuters.com/technology/rss',
-  'https://www.cnbc.com/id/19854910/device/rss/rss.html', // CNBC Technology
-  'https://feeds.feedburner.com/TechCrunch/',
-  'https://www.theverge.com/rss/index.xml',
-  'https://hnrss.org/frontpage' // Hacker News front page
+  // Pure-tech, lower drama:
+  'https://feeds.arstechnica.com/arstechnica/technology-lab',
+  'https://feeds.arstechnica.com/arstechnica/information-technology',
+  'https://www.theverge.com/rss/index.xml',           // Verge Tech
+  'https://techcrunch.com/feed/',                      // TechCrunch
+  'https://hnrss.org/frontpage',                       // HN (we’ll keyword-filter)
+  'https://www.bleepingcomputer.com/feed/',           // Security
+  'https://www.schneier.com/feed/atom/',              // Security policy/tech
+  'https://spectrum.ieee.org/rss/engineering'         // IEEE Spectrum
 ];
 const FEED_LIST = FEEDS.length ? FEEDS : DEFAULT_FEEDS;
 
-const DIGEST_MAX = Number(process.env.NEWS_MAX_ITEMS || 4); // 1–5 recommended
-const LOOKBACK_HOURS = Number(process.env.NEWS_LOOKBACK_HOURS || 24); // recency window
+// Support both env var names (yours and the script’s)
+const DIGEST_MAX = Number(process.env.NEWS_MAX_ITEMS || process.env.MAX_NEWS_PER_POST || 4);
+const LOOKBACK_HOURS = Number(process.env.NEWS_LOOKBACK_HOURS || 24);
+
+// Keyword allowlist (only include if ANY of these appear)
+// Set via env: NEWS_KEYWORDS="ai,ml,gpu,chip,cloud,security,dev,developer,programming,open source,linux,kernel,database,postgres,neon,vector,pgvector"
+const KEYWORDS = (process.env.NEWS_KEYWORDS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// Exclude terms (drop if ANY of these appear)
+// Set via env: NEWS_EXCLUDE="cleopatra,leonardo,dna,biology,celebrity,politics"
+const EXCLUDE = (process.env.NEWS_EXCLUDE || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function passesKeyword(title, source) {
+  const t = (title || '').toLowerCase();
+  const s = (source || '').toLowerCase();
+
+  // Exclusions first
+  if (EXCLUDE.length && EXCLUDE.some(x => t.includes(x) || s.includes(x))) return false;
+
+  // If no allowlist provided, accept all tech-ish items
+  if (!KEYWORDS.length) return true;
+
+  // Otherwise require at least one keyword hit
+  return KEYWORDS.some(x => t.includes(x) || s.includes(x));
+}
+
 
 // Prefer a channel webhook (best). Fallback: Bot token + channel ID.
 const WEBHOOK_URL = process.env.NEWS_WEBHOOK_URL || '';
@@ -90,6 +124,7 @@ async function fetchFeeds() {
       for (const item of (feed.items || [])) {
         const pub = item.isoDate || item.pubDate || new Date().toISOString();
         if (!withinHours(pub, LOOKBACK_HOURS)) continue;
+	if (!passesKeyword(item.title, feed.title)) continue;
         all.push({
           title: item.title || '',
           link: item.link || '',
