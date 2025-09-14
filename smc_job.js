@@ -16,7 +16,11 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
 const NEWS_CHANNEL_ID = process.env.NEWS_CHANNEL_ID || '';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }  // TLS for Neon/managed PG
+});
+
 
 // util
 const toUtc = d => new Date(d).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
@@ -207,3 +211,6 @@ async function postToDiscord(content) {
     await pool.end();
   }
 })();
+
+
+

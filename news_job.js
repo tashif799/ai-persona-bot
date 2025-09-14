@@ -24,7 +24,11 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
 const NEWS_CHANNEL_ID = process.env.NEWS_CHANNEL_ID || '';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }  // TLS for Neon/managed PG
+});
+
 
 function toUtcDateString(d = new Date()) {
   return d.toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
