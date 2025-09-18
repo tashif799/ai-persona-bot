@@ -108,6 +108,37 @@ async function escalate(msg, reason) {
   }
 }
 
+// --- copypasta + emoji helpers ---
+function hasCopypastaInSingleMessage(text) {
+  if (!text) return false;
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length < 30) return false;
+
+  // repeated lines
+  const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const lineCounts = new Map();
+  for (const l of lines) lineCounts.set(l, (lineCounts.get(l) || 0) + 1);
+  if ([...lineCounts.values()].some(c => c >= 3)) return true;
+
+  // repeated sentences
+  const sentences = t.split(/(?<=[.!?])\s+/);
+  const sentCounts = new Map();
+  for (const s of sentences) {
+    if (s.length < 10) continue;
+    sentCounts.set(s, (sentCounts.get(s) || 0) + 1);
+  }
+  if ([...sentCounts.values()].some(c => c >= 3)) return true;
+
+  // repeated chunk pattern
+  return /(.{12,})\1{2,}/s.test(t);
+}
+
+function countEmojis(text) {
+  const emojiRegex = /[\u{1F1E6}-\u{1FAFF}\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{27BF}\u{FE0F}]/gu;
+  const m = text.match(emojiRegex);
+  return m ? m.length : 0;
+}
+
 // ---------- LLM tone classifier ----------
 async function classifyBehavior(text) {
   if (!text || !text.trim()) {
@@ -168,15 +199,21 @@ async function handleModeration(msg) {
     return msg.delete().catch(() => {});
   }
 
-  // copypasta detection
+  // single-message copypasta
+  if (hasCopypastaInSingleMessage(msg.content)) {
+    await escalate(msg, 'Spam (copypasta in single message)');
+    return msg.delete().catch(() => {});
+  }
+
+  // multi-message copypasta
   const duplicates = userMsgs.map((h) => h.text);
   if (duplicates.length >= 3 && new Set(duplicates).size === 1) {
     await escalate(msg, 'Spam (duplicate copypasta)');
     return msg.delete().catch(() => {});
   }
 
-  // emoji spam
-  if ((msg.content.match(/[\p{Emoji}]/gu) || []).length > 10) {
+  // emoji flood (broader detection)
+  if (countEmojis(msg.content) >= 12) {
     await escalate(msg, 'Spam (emoji flood)');
     return msg.delete().catch(() => {});
   }
@@ -212,7 +249,7 @@ async function handleModeration(msg) {
     await escalate(msg, `Hostile tone (${tone.toxicity})`);
   }
 
-  // insults to bot (let’s still escalate explicitly)
+  // insults to bot (explicit escalation)
   if (/stupid bot|fuck you/i.test(msg.content)) {
     await escalate(msg, 'Insulting the bot');
   }
@@ -220,9 +257,8 @@ async function handleModeration(msg) {
   // image moderation placeholder (replace with real classifier later)
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
-      // TODO: connect nsfw/vision model. For now, just log evidence without strike:
+      // Log evidence for now; uncomment next line if you want strict behavior.
       await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
-      // If you want to escalate images immediately, uncomment next line:
       // await escalate(msg, 'Inappropriate image (auto-flag placeholder)');
     }
   }
