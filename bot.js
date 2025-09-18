@@ -48,6 +48,10 @@ const messageHistory = new Map();
 const recentJoins = [];
 const activeConvos = new Map();
 
+// witty callout cooldown
+const lastToneReply = new Map(); // userId -> timestamp
+const TONE_COOLDOWN_MS = 5000;
+
 // ---------- helpers ----------
 function decayStrikes(userId) {
   const entry = strikes.get(userId);
@@ -104,6 +108,46 @@ async function escalate(msg, reason) {
   }
 }
 
+// ---------- LLM tone classifier ----------
+async function classifyBehavior(text) {
+  if (!text || !text.trim()) {
+    return { passive_aggressive: false, condescending: false, provocation: false, toxicity: 'none' };
+  }
+
+  const resp = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+`You label chat messages for moderation tone. Output strict JSON with keys:
+- passive_aggressive: boolean
+- condescending: boolean  (talking down, superiority/flexing/"big-dicking")
+- provocation: boolean    (baiting/escalating)
+- toxicity: "none"|"low"|"medium"|"high"
+No extra text.`
+      },
+      { role: 'user', content: text }
+    ]
+  });
+
+  try {
+    return JSON.parse(resp.choices[0].message.content);
+  } catch {
+    return { passive_aggressive: false, condescending: false, provocation: false, toxicity: 'none' };
+  }
+}
+
+function wittyCallout(tone) {
+  const lines = [];
+  if (tone.passive_aggressive) lines.push('😏 That’s a bit passive-aggressive, don’t you think?');
+  if (tone.condescending)      lines.push('🪜 Climb down from that high horse—talk to people, not at them.');
+  if (tone.provocation)        lines.push('🧯 Chill—no need to pour fuel on the thread.');
+  return lines.join(' ');
+}
+
 // ---------- moderation ----------
 async function handleModeration(msg) {
   if (DISABLED_GUILDS.has(msg.guildId)) return;
@@ -112,7 +156,7 @@ async function handleModeration(msg) {
     return;
   }
 
-  // spam cleanup
+  // spam cleanup (rate limiting)
   const history = messageHistory.get(msg.channelId) || [];
   history.push({ text: msg.content, time: Date.now(), user: msg.author.id });
   if (history.length > 10) history.shift();
@@ -137,7 +181,7 @@ async function handleModeration(msg) {
     return msg.delete().catch(() => {});
   }
 
-  // moderation API
+  // explicit-content moderation API (fast path for slurs/sexual/violence)
   const modRes = await openai.moderations.create({
     model: 'omni-moderation-latest',
     input: msg.content,
@@ -152,31 +196,34 @@ async function handleModeration(msg) {
     }
   }
 
-  // passive aggressive
-  if (/\byou are wrong\b|\bactually\b/i.test(msg.content)) {
-    const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      max_tokens: 50,
-      messages: [
-        { role: 'system', content: 'Detect if passive-aggressive. Reply yes/no.' },
-        { role: 'user', content: msg.content },
-      ],
-    });
-    const out = resp.choices[0].message.content.trim().toLowerCase();
-    if (out.startsWith('yes')) {
-      await msg.reply('😏 That’s a bit passive-aggressive, don’t you think?');
-    }
+  // tone detection via LLM for every message (no regex gate)
+  const tone = await classifyBehavior(msg.content);
+
+  // witty, public nudge with cooldown
+  const now = Date.now();
+  const last = lastToneReply.get(msg.author.id) || 0;
+  if ((tone.passive_aggressive || tone.condescending || tone.provocation) && (now - last >= TONE_COOLDOWN_MS)) {
+    await msg.reply(wittyCallout(tone));
+    lastToneReply.set(msg.author.id, now);
   }
 
-  // insults to bot
+  // escalate on high-severity tone (separate from explicit categories)
+  if (tone.toxicity === 'high' || (tone.toxicity === 'medium' && (tone.condescending || tone.provocation))) {
+    await escalate(msg, `Hostile tone (${tone.toxicity})`);
+  }
+
+  // insults to bot (let’s still escalate explicitly)
   if (/stupid bot|fuck you/i.test(msg.content)) {
     await escalate(msg, 'Insulting the bot');
   }
 
-  // image moderation placeholder
+  // image moderation placeholder (replace with real classifier later)
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
-      await escalate(msg, 'Inappropriate image (auto-flag)');
+      // TODO: connect nsfw/vision model. For now, just log evidence without strike:
+      await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
+      // If you want to escalate images immediately, uncomment next line:
+      // await escalate(msg, 'Inappropriate image (auto-flag placeholder)');
     }
   }
 }
@@ -205,6 +252,7 @@ async function handleConversation(msg) {
   const channelId = msg.channel.id;
   if (activeConvos.get(channelId) === 'off') return;
 
+  // Example entry point: OS debates
   if (/(mac|windows|linux)/i.test(msg.content)) {
     if (!activeConvos.has(channelId)) {
       activeConvos.set(channelId, 'pending');
