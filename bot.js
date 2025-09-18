@@ -110,7 +110,6 @@ async function escalate(msg, reason) {
 
 // ---------- copypasta + emoji helpers ----------
 function normalizeForRepeat(s) {
-  // Lowercase, collapse whitespace, strip zero-width chars
   return s
     .toLowerCase()
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -120,22 +119,21 @@ function normalizeForRepeat(s) {
 
 function hasCopypastaInSingleMessage(text) {
   if (!text) return false;
-  // Fast length gate
   if (text.replace(/\s+/g, ' ').trim().length < 30) return false;
 
-  // 1) Line repeats (same line >=3 times)
+  // 1) Line repeats
   const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
   if (rawLines.length >= 3) {
     const lineCounts = new Map();
     for (const l of rawLines) {
       const k = normalizeForRepeat(l);
-      if (k.length < 20) continue; // ignore tiny lines
+      if (k.length < 20) continue;
       lineCounts.set(k, (lineCounts.get(k) || 0) + 1);
     }
     if ([...lineCounts.values()].some(c => c >= 3)) return true;
   }
 
-  // 2) Sentence repeats (same sentence >=3 times, even with blank lines)
+  // 2) Sentence repeats
   const sentences = normalizeForRepeat(text).split(/(?<=[.!?])\s+/).filter(Boolean);
   if (sentences.length >= 3) {
     const sentCounts = new Map();
@@ -143,14 +141,13 @@ function hasCopypastaInSingleMessage(text) {
       if (s.length < 20) continue;
       sentCounts.set(s, (sentCounts.get(s) || 0) + 1);
     }
-    const maxSent = Math.max(0, ...sentCounts.values());
-    if (maxSent >= 3) return true;
+    if ([...sentCounts.values()].some(c => c >= 3)) return true;
   }
 
-  // 3) Sliding window n-gram (catch big paragraphs repeated)
+  // 3) Sliding window n-gram
   const t = normalizeForRepeat(text);
   if (t.length >= 120) {
-    const window = 60; // characters
+    const window = 60;
     const step = 20;
     const seen = new Map();
     for (let i = 0; i + window <= t.length; i += step) {
@@ -164,10 +161,28 @@ function hasCopypastaInSingleMessage(text) {
 }
 
 function countEmojis(text) {
-  // Covers flags, pictographs, supplemental symbols, dingbats, var selectors
   const emojiRegex = /[\u{1F1E6}-\u{1FAFF}\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{27BF}\u{FE0F}]/gu;
   const m = text.match(emojiRegex);
   return m ? m.length : 0;
+}
+
+// Delete ALL recent duplicate messages from the same author
+async function deleteRecentDuplicates(msg, normalizedTarget, scanLimit = 50, maxAgeMs = 2 * 60 * 1000) {
+  try {
+    const fetched = await msg.channel.messages.fetch({ limit: scanLimit });
+    const now = Date.now();
+    const targets = fetched.filter(m =>
+      m.author?.id === msg.author.id &&
+      normalizeForRepeat(m.content) === normalizedTarget &&
+      (now - m.createdTimestamp) <= maxAgeMs
+    );
+
+    for (const m of targets.values()) {
+      await m.delete().catch(() => {});
+    }
+  } catch (e) {
+    console.error('deleteRecentDuplicates error:', e);
+  }
 }
 
 // ---------- LLM tone classifier ----------
@@ -226,34 +241,35 @@ async function handleModeration(msg) {
 
   const userMsgs = history.filter((h) => h.user === msg.author.id);
   if (userMsgs.length >= 5 && Date.now() - userMsgs[0].time < 5000) {
-    console.log('[moderation] rate-limit spam');
     await escalate(msg, 'Spam (too many messages)');
-    return msg.delete().catch(() => {});
+    await msg.delete().catch(() => {});
+    return;
   }
 
   // single-message copypasta
   if (hasCopypastaInSingleMessage(msg.content)) {
-    console.log('[moderation] copypasta (single message)');
     await escalate(msg, 'Spam (copypasta in single message)');
-    return msg.delete().catch(() => {});
+    await msg.delete().catch(() => {});
+    return;
   }
 
-  // multi-message copypasta
-  const duplicates = userMsgs.map((h) => normalizeForRepeat(h.text));
-  if (duplicates.length >= 3) {
-    const uniq = new Set(duplicates);
-    if (uniq.size === 1 && duplicates[0].length >= 20) {
-      console.log('[moderation] copypasta (multi message)');
+  // multi-message copypasta (delete ALL recent duplicates)
+  const normalizedBatch = userMsgs.map((h) => normalizeForRepeat(h.text));
+  if (normalizedBatch.length >= 3) {
+    const first = normalizedBatch[0];
+    const allSame = normalizedBatch.every(x => x === first) && first.length >= 20;
+    if (allSame) {
       await escalate(msg, 'Spam (duplicate copypasta)');
-      return msg.delete().catch(() => {});
+      await deleteRecentDuplicates(msg, first, 50, 10 * 60 * 1000); // delete same duplicates in last 10 minutes
+      return;
     }
   }
 
   // emoji flood (broader detection)
   if (countEmojis(msg.content) >= 12) {
-    console.log('[moderation] emoji flood');
     await escalate(msg, 'Spam (emoji flood)');
-    return msg.delete().catch(() => {});
+    await msg.delete().catch(() => {});
+    return;
   }
 
   // explicit-content moderation API (fast path for slurs/sexual/violence)
@@ -264,7 +280,6 @@ async function handleModeration(msg) {
   const flagged = modRes.results[0];
 
   if (flagged.flagged) {
-    console.log('[moderation] openai moderation flagged categories');
     if (flagged.categories.harassment) {
       await escalate(msg, 'Harassment');
     } else if (flagged.categories.hate || flagged.categories.violence) {
@@ -285,13 +300,11 @@ async function handleModeration(msg) {
 
   // escalate on high-severity tone (separate from explicit categories)
   if (tone.toxicity === 'high' || (tone.toxicity === 'medium' && (tone.condescending || tone.provocation))) {
-    console.log('[moderation] tone-based escalation');
     await escalate(msg, `Hostile tone (${tone.toxicity})`);
   }
 
   // insults to bot (explicit escalation)
   if (/stupid bot|fuck you/i.test(msg.content)) {
-    console.log('[moderation] insult to bot');
     await escalate(msg, 'Insulting the bot');
   }
 
@@ -299,7 +312,7 @@ async function handleModeration(msg) {
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
       await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
-      // For strict behavior, uncomment next line:
+      // If you want strict behavior now:
       // await escalate(msg, 'Inappropriate image (auto-flag placeholder)');
     }
   }
