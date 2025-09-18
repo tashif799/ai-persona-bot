@@ -10,7 +10,12 @@ import OpenAI from 'openai';
 import fs from 'node:fs/promises';
 
 import { embed } from './embed.js';
-import { rememberEmbedding, searchSimilar } from './db.js';
+import {
+  rememberEmbedding,
+  searchSimilar,
+  rememberUserQuirk,
+  getUserQuirks,
+} from './db.js';
 
 // ---------- load persona ----------
 let persona = JSON.parse(await fs.readFile('./persona/kmwyl.json', 'utf8'));
@@ -30,7 +35,7 @@ const client = new Client({
 
 const OWNER_ID = process.env.OWNER_ID?.trim();
 const PERSONA_ID = 'kmwyl';
-const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID; // channel for evidence logs
+const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
 
 // ---------- moderation state ----------
 const strikes = new Map(); // userId -> { count, lastStrike }
@@ -38,17 +43,10 @@ const STRIKE_LIMITS = { warn: 1, timeout: 2, kick: 3, ban: 4 };
 const STRIKE_DECAY_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
 
 const DISABLED_GUILDS = new Set();
-const shadowBanned = new Set(); // userIds
-const messageHistory = new Map(); // channelId -> [lastMsgs]
-
-// anti-raid
+const shadowBanned = new Set();
+const messageHistory = new Map();
 const recentJoins = [];
-
-// conversation
 const activeConvos = new Map();
-
-// memory of users (quirks)
-const userMemory = new Map();
 
 // ---------- helpers ----------
 function decayStrikes(userId) {
@@ -175,22 +173,28 @@ async function handleModeration(msg) {
     await escalate(msg, 'Insulting the bot');
   }
 
-  // image moderation (simple heuristic: check alt text)
+  // image moderation placeholder
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
-      // TODO: run NSFW classifier (e.g. nsfwjs) here
-      // Placeholder: auto-flag
       await escalate(msg, 'Inappropriate image (auto-flag)');
     }
   }
 }
 
 // ---------- conversation ----------
-async function chatWithAI(text) {
+async function chatWithAI(text, userId) {
+  const quirks = await getUserQuirks(userId);
+  const systemPrompt = `
+You are "${persona.display_name}" (${persona.pronouns}).
+Style: ${persona.style}.
+Be witty, playful, and socially aware.
+${quirks.length ? `This user’s quirks: ${quirks.join('; ')}` : ''}
+  `.trim();
+
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
-      { role: 'system', content: `You are a witty Discord mod with personality: ${persona.style}` },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: text },
     ],
   });
@@ -205,8 +209,9 @@ async function handleConversation(msg) {
     if (!activeConvos.has(channelId)) {
       activeConvos.set(channelId, 'pending');
       await msg.reply('💻 Want me to join this debate? (yes/no)');
+      await rememberUserQuirk(msg.author.id, 'Started an OS debate');
     } else if (activeConvos.get(channelId) === 'on') {
-      const reply = await chatWithAI(msg.content);
+      const reply = await chatWithAI(msg.content, msg.author.id);
       await msg.reply(reply);
     }
   }
@@ -221,8 +226,26 @@ async function handleConversation(msg) {
   }
 }
 
+// ---------- auto threads ----------
+async function handleAutoThreads(msg) {
+  if (!msg.reference) return;
+  const refMsg = await msg.fetchReference().catch(() => null);
+  if (!refMsg) return;
+
+  const replies = await msg.channel.messages.fetch({ after: refMsg.id });
+  const count = replies.filter(r => r.reference?.messageId === refMsg.id).size;
+
+  if (count >= 20 && !refMsg.hasThread) {
+    const thread = await refMsg.startThread({
+      name: `Topic by ${refMsg.author.username}`,
+      autoArchiveDuration: 60,
+    });
+    await thread.send('📌 Moving this long convo into a thread!');
+  }
+}
+
 // ---------- voting enforcement ----------
-client.on(Events.MessageReactionAdd, async (reaction, user) => {
+client.on(Events.MessageReactionAdd, async (reaction) => {
   if (reaction.emoji.name !== '🚫') return;
   const msg = reaction.message;
   if (!msg.guild) return;
@@ -247,7 +270,7 @@ client.on(Events.GuildMemberAdd, (member) => {
         ch.permissionOverwrites.edit(everyoneRole, { SendMessages: false });
       }
     });
-    member.guild.systemChannel?.send('🚨 Anti-raid mode activated: chat locked for new members.');
+    member.guild.systemChannel?.send('🚨 Anti-raid mode activated: chat locked.');
   }
 });
 
@@ -290,6 +313,7 @@ client.on(Events.MessageCreate, async (msg) => {
 
   await handleModeration(msg);
   await handleConversation(msg);
+  await handleAutoThreads(msg);
 });
 
 // ---------- startup ----------
