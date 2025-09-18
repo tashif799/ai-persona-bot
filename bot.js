@@ -15,6 +15,10 @@ import {
   searchSimilar,
   rememberUserQuirk,
   getUserQuirks,
+  logModerationEvent,
+  getRecentIncidents,
+  getUserBehaviorSummary,
+  getTopSuspects,
 } from './db.js';
 
 // ---------- load persona ----------
@@ -84,33 +88,64 @@ async function logEvidence(guild, msg, reason, action) {
   }
 }
 
+async function recordLog(msg, { harassment=false, hate=false, violence=false, tone={}, action='none' } = {}) {
+  const { passive_aggressive=false, condescending=false, provocation=false, toxicity='none' } = tone || {};
+  try {
+    await logModerationEvent({
+      guildId: msg.guildId,
+      channelId: msg.channelId,
+      userId: msg.author.id,
+      messageId: msg.id,
+      content: msg.content || '',
+      harassment, hate, violence,
+      passive_aggr: passive_aggressive,
+      condescending,
+      provocation,
+      toxicity,
+      action_taken: action
+    });
+  } catch (e) {
+    console.error('logModerationEvent failed:', e);
+  }
+}
+
 async function escalate(msg, reason) {
   const id = msg.author.id;
   const prev = decayStrikes(id);
   const count = prev + 1;
   strikes.set(id, { count, lastStrike: Date.now() });
 
+  let action = 'none';
+
   if (count === STRIKE_LIMITS.warn) {
+    action = 'warn';
     await msg.reply(`⚠️ ${msg.author}, warning: ${reason}`);
     await logEvidence(msg.guild, msg, reason, 'Warn');
   } else if (count === STRIKE_LIMITS.timeout) {
+    action = 'timeout';
     await msg.member.timeout(10 * 60 * 1000, reason);
     await msg.reply('⏳ Timed out for 10m.');
     await logEvidence(msg.guild, msg, reason, 'Timeout');
   } else if (count === STRIKE_LIMITS.kick) {
+    action = 'kick';
     await msg.member.kick(reason);
     await msg.channel.send(`${msg.author.tag} was kicked.`);
     await logEvidence(msg.guild, msg, reason, 'Kick');
   } else if (count >= STRIKE_LIMITS.ban) {
+    action = 'ban';
     await msg.member.ban({ reason });
     await msg.channel.send(`${msg.author.tag} was banned.`);
     await logEvidence(msg.guild, msg, reason, 'Ban');
   }
+
+  // record the escalation event
+  await recordLog(msg, { action });
+  return action;
 }
 
 // ---------- copypasta + emoji helpers ----------
 function normalizeForRepeat(s) {
-  return s
+  return (s || '')
     .toLowerCase()
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
     .replace(/\s+/g, ' ')
@@ -162,12 +197,11 @@ function hasCopypastaInSingleMessage(text) {
 
 function countEmojis(text) {
   const emojiRegex = /[\u{1F1E6}-\u{1FAFF}\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{27BF}\u{FE0F}]/gu;
-  const m = text.match(emojiRegex);
+  const m = (text || '').match(emojiRegex);
   return m ? m.length : 0;
 }
 
-// Delete ALL recent duplicate messages from the same author
-async function deleteRecentDuplicates(msg, normalizedTarget, scanLimit = 50, maxAgeMs = 2 * 60 * 1000) {
+async function deleteRecentDuplicates(msg, normalizedTarget, scanLimit = 50, maxAgeMs = 10 * 60 * 1000) {
   try {
     const fetched = await msg.channel.messages.fetch({ limit: scanLimit });
     const now = Date.now();
@@ -176,10 +210,11 @@ async function deleteRecentDuplicates(msg, normalizedTarget, scanLimit = 50, max
       normalizeForRepeat(m.content) === normalizedTarget &&
       (now - m.createdTimestamp) <= maxAgeMs
     );
-
     for (const m of targets.values()) {
       await m.delete().catch(() => {});
     }
+    // log one consolidated record for this clean-up pass
+    await recordLog(msg, { action: 'delete' });
   } catch (e) {
     console.error('deleteRecentDuplicates error:', e);
   }
@@ -243,6 +278,7 @@ async function handleModeration(msg) {
   if (userMsgs.length >= 5 && Date.now() - userMsgs[0].time < 5000) {
     await escalate(msg, 'Spam (too many messages)');
     await msg.delete().catch(() => {});
+    await recordLog(msg, { action: 'delete' });
     return;
   }
 
@@ -250,6 +286,7 @@ async function handleModeration(msg) {
   if (hasCopypastaInSingleMessage(msg.content)) {
     await escalate(msg, 'Spam (copypasta in single message)');
     await msg.delete().catch(() => {});
+    await recordLog(msg, { action: 'delete' });
     return;
   }
 
@@ -260,7 +297,7 @@ async function handleModeration(msg) {
     const allSame = normalizedBatch.every(x => x === first) && first.length >= 20;
     if (allSame) {
       await escalate(msg, 'Spam (duplicate copypasta)');
-      await deleteRecentDuplicates(msg, first, 50, 10 * 60 * 1000); // delete same duplicates in last 10 minutes
+      await deleteRecentDuplicates(msg, first, 50, 10 * 60 * 1000);
       return;
     }
   }
@@ -269,10 +306,11 @@ async function handleModeration(msg) {
   if (countEmojis(msg.content) >= 12) {
     await escalate(msg, 'Spam (emoji flood)');
     await msg.delete().catch(() => {});
+    await recordLog(msg, { action: 'delete' });
     return;
   }
 
-  // explicit-content moderation API (fast path for slurs/sexual/violence)
+  // explicit-content moderation API
   const modRes = await openai.moderations.create({
     model: 'omni-moderation-latest',
     input: msg.content,
@@ -287,7 +325,7 @@ async function handleModeration(msg) {
     }
   }
 
-  // tone detection via LLM for every message (no regex gate)
+  // tone detection via LLM
   const tone = await classifyBehavior(msg.content);
 
   // witty, public nudge with cooldown
@@ -298,22 +336,34 @@ async function handleModeration(msg) {
     lastToneReply.set(msg.author.id, now);
   }
 
-  // escalate on high-severity tone (separate from explicit categories)
+  // tone-based escalation
   if (tone.toxicity === 'high' || (tone.toxicity === 'medium' && (tone.condescending || tone.provocation))) {
     await escalate(msg, `Hostile tone (${tone.toxicity})`);
   }
 
-  // insults to bot (explicit escalation)
+  // insults to bot
   if (/stupid bot|fuck you/i.test(msg.content)) {
     await escalate(msg, 'Insulting the bot');
   }
 
-  // image moderation placeholder (replace with real classifier later)
+  // log the moderation result for this message (even if no action)
+  await recordLog(msg, {
+    harassment: !!flagged?.categories?.harassment,
+    hate: !!flagged?.categories?.hate,
+    violence: !!flagged?.categories?.violence,
+    tone: {
+      passive_aggressive: !!tone.passive_aggressive,
+      condescending: !!tone.condescending,
+      provocation: !!tone.provocation,
+      toxicity: tone.toxicity || 'none'
+    },
+    action: 'none'
+  });
+
+  // image moderation placeholder
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
       await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
-      // If you want strict behavior now:
-      // await escalate(msg, 'Inappropriate image (auto-flag placeholder)');
     }
   }
 }
@@ -342,7 +392,6 @@ async function handleConversation(msg) {
   const channelId = msg.channel.id;
   if (activeConvos.get(channelId) === 'off') return;
 
-  // Example entry point: OS debates
   if (/(mac|windows|linux)/i.test(msg.content)) {
     if (!activeConvos.has(channelId)) {
       activeConvos.set(channelId, 'pending');
@@ -392,6 +441,7 @@ client.on(Events.MessageReactionAdd, async (reaction) => {
   if (reaction.count >= 3) {
     await escalate(msg, 'Community voted 🚫');
     await msg.delete().catch(() => {});
+    await recordLog(msg, { action: 'delete' });
   }
 });
 
@@ -412,12 +462,13 @@ client.on(Events.GuildMemberAdd, (member) => {
   }
 });
 
-// ---------- admin commands ----------
+// ---------- admin + SUS commands ----------
 client.on(Events.MessageCreate, async (msg) => {
   if (!msg.guild || msg.author.bot) return;
   const isOwner = msg.author.id === OWNER_ID;
 
   if (isOwner) {
+    // forgiveness & toggles
     if (msg.content.startsWith('!forgive')) {
       const target = msg.mentions.users.first();
       if (target) {
@@ -446,6 +497,53 @@ client.on(Events.MessageCreate, async (msg) => {
         shadowBanned.delete(target.id);
         await msg.reply(`🌞 Un-shadowbanned ${target.username}.`);
       }
+    }
+
+    // SUS: per-user summary
+    if (msg.content.startsWith('!sus ')) {
+      const m = msg.content.split(/\s+/);
+      const target = msg.mentions.users.first();
+      const hours = Number(m[m.length - 1]) || 24;
+      if (!target) return msg.reply('Usage: `!sus @user [hours]`');
+      const s = await getUserBehaviorSummary({ userId: target.id, hours });
+      await msg.reply(
+        `🕵️ Report for <@${target.id}> (last ${hours}h):\n` +
+        `• incidents: ${s.total || 0}\n` +
+        `• passive-aggr: ${s.passive_aggr || 0}\n` +
+        `• condescending: ${s.condescending || 0}\n` +
+        `• provocation: ${s.provocation || 0}\n` +
+        `• actions taken: ${s.actions || 0}`
+      );
+      return;
+    }
+
+    // SUS: recent incidents list
+    if (msg.content.startsWith('!susrecent')) {
+      const parts = msg.content.split(/\s+/);
+      const hours = Number(parts[1]) || 24;
+      const limit = Number(parts[2]) || 10;
+      const rows = await getRecentIncidents({ guildId: msg.guildId, hours, limit });
+      if (!rows.length) return msg.reply(`No incidents in last ${hours}h.`);
+      const lines = rows.map(r =>
+        `• <@${r.user_id}> ${r.action_taken || 'none'} ` +
+        `${r.passive_aggr ? 'PA ' : ''}${r.condescending ? 'COND ' : ''}${r.provocation ? 'PROV ' : ''}`.trim()
+      );
+      await msg.reply(`🧾 Recent incidents (last ${hours}h):\n${lines.join('\n')}`);
+      return;
+    }
+
+    // SUS: top suspects
+    if (msg.content.startsWith('!suswho')) {
+      const parts = msg.content.split(/\s+/);
+      const hours = Number(parts[1]) || 24;
+      const limit = Number(parts[2]) || 5;
+      const rows = await getTopSuspects({ guildId: msg.guildId, hours, limit });
+      if (!rows.length) return msg.reply(`Clean slate in last ${hours}h.`);
+      const lines = rows.map((r, i) =>
+        `${i+1}. <@${r.user_id}> — actions: ${r.actions}, tone flags: ${r.tone_flags}, incidents: ${r.incidents}`
+      );
+      await msg.reply(`🏴 Top suspects (last ${hours}h):\n${lines.join('\n')}`);
+      return;
     }
   }
 
