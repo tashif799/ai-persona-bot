@@ -1,4 +1,4 @@
-// smc_job.js — SMC newsroom + events digest (Discord webhook)
+// smc_job.js — SMC newsroom + events + Corsair + In Focus + Trustees digest (Discord webhook)
 import 'dotenv/config';
 import OpenAI from 'openai';
 import pg from 'pg';
@@ -6,20 +6,26 @@ import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 
 // ---------- env ----------
-const NEWS_URL   = process.env.SMC_NEWS_URL    || 'https://www.smc.edu/newsroom/';
-const EVENTS_URL = process.env.SMC_EVENTS_URL  || 'https://www.smc.edu/calendar/';
-const WEBHOOK    = process.env.SMC_WEBHOOK_URL || '';
-const MAX_ITEMS  = Number(process.env.SMC_MAX_ITEMS || 4);
-const LOOKBACK_H = Number(process.env.SMC_LOOKBACK_HOURS || 48);
+const NEWS_URL    = process.env.SMC_NEWS_URL    || 'https://www.smc.edu/news/';
+const EVENTS_URL  = process.env.SMC_EVENTS_URL  || 'https://www.smc.edu/calendar/';
+const HOME_URL    = process.env.SMC_HOME_URL    || 'https://www.smc.edu/';
+const CORSAIR_URL = process.env.SMC_CORSAIR_URL || 'https://www.thecorsaironline.com/';
+const IN_FOCUS_URL= process.env.SMC_IN_FOCUS_URL|| 'https://www.smc.edu/news/in-focus/';
+const TRUSTEES_URL= process.env.SMC_TRUSTEES_URL|| 'https://admin.smc.edu/administration/governance/board-of-trustees/meetings.php';
+
+const WEBHOOK    = (process.env.SMC_WEBHOOK_URL || '').trim();
+const MAX_ITEMS  = Number(process.env.SMC_MAX_ITEMS || 6);
+const LOOKBACK_H = Number(process.env.SMC_LOOKBACK_HOURS || 72); // 3 days default
+const PER_SOURCE_LIMIT = Number(process.env.SMC_PER_SOURCE_LIMIT || 4);
 const DEBUG = process.env.SMC_DEBUG === '1';
-const SEED  = process.env.SMC_SEED === '1';
+const SEED  = process.env.SMC_SEED === '1'; // for testing, bypass date filters
 function d(...a){ if (DEBUG) console.log('[SMC]', ...a); }
 
 if (!WEBHOOK) throw new Error('SMC_WEBHOOK_URL is required');
 
 // OpenAI (trim key to avoid bad header errors)
 const OPENAI_KEY = (process.env.OPENAI_API_KEY || '').trim();
-const openai = new OpenAI({ apiKey: OPENAI_KEY });
+const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
 
 // ---------- optional DB for dedupe ----------
 const HAS_DB = !!process.env.DATABASE_URL;
@@ -40,8 +46,11 @@ async function ensureTables() {
       id SERIAL PRIMARY KEY,
       url TEXT UNIQUE,
       title TEXT,
+      source TEXT,
+      published_at TIMESTAMPTZ,
       posted_at TIMESTAMPTZ DEFAULT now()
-    )
+    );
+    CREATE INDEX IF NOT EXISTS smc_digest_log_published_idx ON smc_digest_log (published_at DESC);
   `);
 }
 async function seen(url) {
@@ -49,167 +58,353 @@ async function seen(url) {
   const { rows } = await pool.query(`SELECT 1 FROM smc_digest_log WHERE url=$1`, [url]);
   return rows.length > 0;
 }
-async function mark(url, title) {
+async function mark({url, title, source, publishedAt}) {
   if (!HAS_DB) { memSeen.add(url); return; }
   await pool.query(
-    `INSERT INTO smc_digest_log (url, title) VALUES ($1,$2) ON CONFLICT (url) DO NOTHING`,
-    [url, title]
+    `INSERT INTO smc_digest_log (url, title, source, published_at)
+     VALUES ($1,$2,$3,$4) ON CONFLICT (url) DO NOTHING`,
+    [url, title || null, source || null, publishedAt ? new Date(publishedAt) : null]
   );
 }
 
 // ---------- helpers ----------
-function withinHours(dateStr, hours) {
-  if (SEED) return true;
-  if (!dateStr) return true;
-  const dte = new Date(dateStr);
-  if (isNaN(dte)) return true;
-  return (Date.now() - dte.getTime()) <= hours * 3600 * 1000;
-}
-function getHTML(url) {
-  return fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (SMC Digest Bot)' } })
-    .then(res => {
-      if (!res.ok) throw new Error(`Fetch failed ${res.status} ${url}`);
-      return res.text();
-    });
-}
-function hasDateHint(text) {
-  const s = (text || '').replace(/\s+/g, ' ');
-  return (
-    /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i.test(s) ||
-    /\b\d{4}-\d{1,2}-\d{1,2}\b/.test(s) ||
-    /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/.test(s) ||
-    /\b\d{1,2}:\d{2}\s?(?:am|pm)\b/i.test(s)
-  );
-}
-function isNewsUrl(abs) {
-  try {
-    const p = new URL(abs).pathname.toLowerCase();
-    if (!(p.includes('/newsroom') || p.includes('/news'))) return false;
-    if (/\/index(\.php)?$/.test(p)) return false;        // skip section index pages
-    if (/\/about|\/facts-stats|\/history/.test(p)) return false; // skip generic info
-    return true;
-  } catch { return false; }
-}
-function isEventUrl(abs, title) {
-  try {
-    const p = new URL(abs).pathname.toLowerCase();
-    if (!(p.includes('/calendar') || p.includes('/events'))) return false;
-    return hasDateHint(`${title} ${p}`);
-  } catch { return false; }
+const LA_TZ = process.env.TZ || 'America/Los_Angeles';
+
+function parseDateLoose(s) {
+  if (!s) return null;
+  // common formats: "September 16, 2025", "Sep 18, 2025", "9-9-2025", "9/9/2025"
+  const cleaned = String(s).replace(/\s+/g, ' ').trim()
+    .replace(/\bsept\b/i, 'Sep') // sometimes Sept
+    .replace(/\u00A0/g, ' ');
+  // Try native Date first
+  const dt = new Date(cleaned);
+  if (!isNaN(dt)) return dt;
+  // Try mm-dd-yyyy or mm/dd/yyyy
+  const m = cleaned.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/);
+  if (m) {
+    const [ , mm, dd, yyyy ] = m; 
+    const y = Number(yyyy.length === 2 ? ('20' + yyyy) : yyyy);
+    const d = new Date(Date.UTC(y, Number(mm)-1, Number(dd)));
+    if (!isNaN(d)) return d;
+  }
+  return null;
 }
 
-// ---------- scrape newsroom ----------
+async function getHTML(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (SMC Digest Bot)' } });
+  if (!res.ok) throw new Error(`Fetch failed ${res.status} ${url}`);
+  return res.text();
+}
+
+function hoursAgo(h) {
+  return Date.now() - h * 3600 * 1000;
+}
+
+function isFresh(dateOrNull) {
+  if (SEED) return true;
+  if (!dateOrNull) return false; // IMPORTANT: no date means NOT fresh (fixes old posts slipping in)
+  return new Date(dateOrNull).getTime() >= hoursAgo(LOOKBACK_H);
+}
+
+function pickFields(obj, fields) {
+  const out = {}; for (const k of fields) out[k] = obj[k]; return out;
+}
+
+async function detectPublishedFromPage(url, htmlCache) {
+  try {
+    const html = htmlCache || await getHTML(url);
+    const $ = cheerio.load(html);
+
+    // 1) explicit time tags
+    const timeDT = $('time[datetime]').attr('datetime') || $('time').first().text();
+    let dt = parseDateLoose(timeDT);
+
+    // 2) meta tags (og/article)
+    if (!dt) {
+      const meta = $('meta[property="article:published_time"]').attr('content')
+              || $('meta[name="pubdate"]').attr('content')
+              || $('meta[itemprop="datePublished"]').attr('content')
+              || $('meta[name="date"]').attr('content');
+      dt = parseDateLoose(meta);
+    }
+
+    // 3) JSON-LD
+    if (!dt) {
+      $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+          const j = JSON.parse($(el).contents().text());
+          const list = Array.isArray(j) ? j : [j];
+          for (const item of list) {
+            const cand = item?.datePublished || item?.dateCreated || item?.uploadDate;
+            const parsed = parseDateLoose(cand);
+            if (parsed) { dt = parsed; break; }
+          }
+        } catch(_) {}
+      });
+    }
+    return dt || null;
+  } catch (_) { return null; }
+}
+
+function normItem(it) {
+  // Ensure required shape
+  const title = (it.title || '').replace(/\s+/g,' ').trim();
+  const link  = it.link;
+  return {
+    source: it.source || 'SMC',
+    title,
+    link,
+    dateText: it.dateText || '',
+    publishedAt: it.publishedAt || null,
+    blurb: (it.blurb || '').replace(/\s+/g,' ').trim(),
+  };
+}
+
+// Deduplicate by URL
+function dedupe(items) {
+  const seen = new Set();
+  return items.filter(it => {
+    const k = it.link?.split('#')[0];
+    if (!k || seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+}
+
+function limitPerSource(items, perSource = PER_SOURCE_LIMIT) {
+  const counts = new Map();
+  const out = [];
+  for (const it of items) {
+    const s = it.source || 'SMC';
+    const c = counts.get(s) || 0;
+    if (c < perSource) { out.push(it); counts.set(s, c+1); }
+  }
+  return out;
+}
+
+// ---------- scrapers ----------
+// 1) SMC News (official newsroom listing)
 async function scrapeNewsroom() {
   const html = await getHTML(NEWS_URL);
   const $ = cheerio.load(html);
   const items = [];
 
-  const SELS = ['article a', 'li a', 'h2 a', 'h3 a', 'div a', 'section a', 'a'];
-  for (const sel of SELS) {
-    $(sel).each((_, el) => {
-      const a = $(el);
-      const href  = a.attr('href') || '';
-      const title = a.text().replace(/\s+/g,' ').trim();
-      if (!href || !title) return;
-      const abs = href.startsWith('http') ? href : new URL(href, NEWS_URL).href;
-      if (!/smc\.edu/i.test(abs) || !isNewsUrl(abs)) return;
+  $('article a, li a, h2 a, h3 a, div a, section a, a').each((_, el) => {
+    const a = $(el);
+    const href  = a.attr('href') || '';
+    const title = a.text().replace(/\s+/g,' ').trim();
+    if (!href || !title) return;
+    const abs = href.startsWith('http') ? href : new URL(href, NEWS_URL).href;
+    const p = new URL(abs).pathname.toLowerCase();
+    if (!/smc\.edu/i.test(abs)) return;
+    if (!(p.includes('/news') || p.includes('/newsroom'))) return;
+    if (/\/index(\.php)?$/.test(p)) return; // skip indices
 
-      const bloc = a.closest('article,li,div,section');
-      const dateText =
-        bloc.find('time').attr('datetime') ||
-        bloc.find('time').text() ||
-        bloc.find('.date,.published,.meta').text() ||
-        '';
+    const bloc = a.closest('article,li,div,section');
+    const dateText = bloc.find('time').attr('datetime')
+                   || bloc.find('time').first().text()
+                   || bloc.find('.date,.published,.meta').first().text()
+                   || '';
+    const publishedAt = parseDateLoose(dateText);
+    items.push(normItem({ source: 'SMC Newsroom', title, link: abs, dateText, publishedAt }));
+  });
 
-      items.push({ source: 'SMC Newsroom', title, link: abs, dateText });
-    });
+  // If date missing, try fetching page to detect date
+  for (const it of items) {
+    if (!it.publishedAt) {
+      const detected = await detectPublishedFromPage(it.link);
+      if (detected) it.publishedAt = detected;
+    }
   }
 
-  const seen = new Set();
-  const deduped = items.filter(it => (seen.has(it.link) ? false : (seen.add(it.link), true)));
-  const recent = deduped.filter(it => withinHours(it.dateText, LOOKBACK_H));
-  d('newsroom found:', items.length, 'deduped:', deduped.length, 'recent:', recent.length);
-  if (DEBUG) d('sample news:', recent.slice(0,3));
-  return recent;
+  const ded = dedupe(items);
+  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  d('newsroom found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
+  return fresh;
 }
 
-// ---------- scrape events ----------
-async function scrapeEvents() {
-  const html = await getHTML(EVENTS_URL);
+// 2) Events — grab "Events Happening at SMC" from homepage (server-rendered)
+async function scrapeHomeEvents() {
+  const html = await getHTML(HOME_URL);
   const $ = cheerio.load(html);
   const items = [];
 
-  const SELS = [
-    '[class*=event]','[class*=Event]','.event','.event-item',
-    '.calendar__event','.events-list a','article a','li a','h3 a','a'
-  ];
-  for (const sel of SELS) {
-    $(sel).each((_, el) => {
-      const $el = $(el);
-      const a = $el.is('a') ? $el : $el.find('a').first();
-      const href  = a.attr('href') || '';
-      const title = a.text().replace(/\s+/g,' ').trim();
-      if (!href || !title) return;
+  // Find the section header
+  const header = $('*:contains("Events Happening at SMC")').filter((_, el) => $(el).text().trim() === 'Events Happening at SMC').first();
+  const scope = header.length ? header.closest('section,div').parent() : $.root();
 
-      const abs = href.startsWith('http') ? href : new URL(href, EVENTS_URL).href;
-      if (!/smc\.edu/i.test(abs) || !isEventUrl(abs, title)) return;
+  // Pick event cards near the header
+  scope.find('a').each((_, el) => {
+    const a = $(el);
+    const title = a.text().replace(/\s+/g, ' ').trim();
+    const href = a.attr('href');
+    if (!title || !href) return;
+    const abs = href.startsWith('http') ? href : new URL(href, HOME_URL).href;
+    if (!/smc\.edu\//i.test(abs)) return;
+    const card = a.closest('article,li,div,section');
+    // Dates often appear near the link
+    const dateLine = card.text().split('\n').map(s=>s.trim()).filter(Boolean)
+      .find(t => /(\b[A-Z][a-z]{2,8} \d{1,2}\b|\b\d{1,2}:\d{2}\b|AM|PM|a\.m\.|p\.m\.)/.test(t));
+    const publishedAt = parseDateLoose(dateLine) || null; // event date (may be in future)
+    const dtForFreshness = publishedAt || null;
+    items.push(normItem({ source: 'SMC Events', title, link: abs, dateText: dateLine||'', publishedAt: dtForFreshness }));
+  });
 
-      const bloc = $el.closest('article,li,div,section');
-      const dateText =
-        bloc.find('time').attr('datetime') ||
-        bloc.find('time').text() ||
-        bloc.find('.date,.when,.meta').text() ||
-        '';
-
-      items.push({ source: 'SMC Events', title, link: abs, dateText });
-    });
-  }
-
-  const seen = new Set();
-  const deduped = items.filter(it => (seen.has(it.link) ? false : (seen.add(it.link), true)));
-  const recent = deduped.filter(it => withinHours(it.dateText, LOOKBACK_H));
-  d('events found:', items.length, 'deduped:', deduped.length, 'recent:', recent.length);
-  if (DEBUG) d('sample events:', recent.slice(0,3));
-  return recent;
+  const ded = dedupe(items);
+  // For events, keep ones happening soon OR recently posted. We treat lack of date as not fresh.
+  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  d('home events found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
+  return fresh.slice(0, 12);
 }
 
-// ---------- summarise + post ----------
+// 3) The Corsair (student newspaper)
+async function scrapeCorsair() {
+  const html = await getHTML(CORSAIR_URL);
+  const $ = cheerio.load(html);
+  const items = [];
+
+  // Look for article blocks; grab obvious main feed cards
+  $('a').each((_, el) => {
+    const a = $(el);
+    const href = a.attr('href') || '';
+    const title = a.text().replace(/\s+/g,' ').trim();
+    if (!href || !title) return;
+    const abs = href.startsWith('http') ? href : new URL(href, CORSAIR_URL).href;
+    if (!/thecorsaironline\.com\//i.test(abs)) return;
+    // Only take content pages (not category roots)
+    if (/\/category\//i.test(abs) || /\/#/.test(abs)) return;
+    // Find date nearby
+    const bloc = a.closest('article,div,li,section');
+    const dateText = bloc.find('time').first().text() ||
+                     bloc.text().match(/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}, \d{4}\b/i)?.[0] || '';
+    const publishedAt = parseDateLoose(dateText);
+    // Heuristic: ensure the title isn't just the section name
+    if (title.length > 6) items.push(normItem({ source: 'The Corsair', title, link: abs, dateText, publishedAt }));
+  });
+
+  // If any items lacking dates, try fetch pages for meta date
+  for (const it of items) {
+    if (!it.publishedAt) {
+      const detected = await detectPublishedFromPage(it.link);
+      if (detected) it.publishedAt = detected;
+    }
+  }
+
+  const ded = dedupe(items);
+  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  d('corsair found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
+  return fresh.slice(0, 12);
+}
+
+// 4) SMC In Focus (magazine/feature)
+async function scrapeInFocus() {
+  const html = await getHTML(IN_FOCUS_URL);
+  const $ = cheerio.load(html);
+  const items = [];
+
+  // Try to parse issue date like: "Volume XI, Issue 4, September 2, 2025"
+  let issueDate = null;
+  $('*:contains("Volume ")').each((_, el) => {
+    const t = $(el).text();
+    const m = t.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}/i);
+    if (m) { issueDate = m[0]; return false; }
+  });
+  const issueDt = parseDateLoose(issueDate);
+
+  // Collect article links in this issue
+  $('a:contains("Read Article"), h2 a, .newsfeed-title a, .feature a').each((_, el) => {
+    const a = $(el);
+    const href = a.attr('href');
+    if (!href) return;
+    const abs = href.startsWith('http') ? href : new URL(href, IN_FOCUS_URL).href;
+    const title = (a.text() || a.closest('article,div,section').find('h2,h3').first().text() || '').replace(/\s+/g,' ').trim();
+    if (!title) return;
+    items.push(normItem({ source: 'SMC In Focus', title, link: abs, dateText: issueDate || '', publishedAt: issueDt }));
+  });
+
+  // Fallback: detect each page's date if missing
+  for (const it of items) {
+    if (!it.publishedAt) {
+      const detected = await detectPublishedFromPage(it.link);
+      if (detected) it.publishedAt = detected;
+    }
+  }
+
+  const ded = dedupe(items);
+  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  d('in-focus found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
+  return fresh.slice(0, 8);
+}
+
+// 5) Board of Trustees — latest agendas/minutes (governance signals)
+async function scrapeTrustees() {
+  const html = await getHTML(TRUSTEES_URL);
+  const $ = cheerio.load(html);
+  const items = [];
+
+  // Target 2025 section first, then 2024
+  const yearHeaders = $('h3:contains("2025"), h3:contains("2024")');
+  yearHeaders.each((_, h) => {
+    const yearBlock = $(h).nextUntil('h3');
+    // Look for links like "9-9-2025 Agenda" and "Minutes"
+    yearBlock.find('a').each((__, aEl) => {
+      const a = $(aEl);
+      const href = a.attr('href');
+      const text = a.text();
+      if (!href || !/\.(pdf|docx?)($|\?)/i.test(href)) return; // only concrete docs
+      const abs = href.startsWith('http') ? href : new URL(href, TRUSTEES_URL).href;
+      // Date in link text like 9-9-2025
+      const dateInText = text.match(/\b\d{1,2}[\-\/]\d{1,2}[\-\/]\d{2,4}\b/);
+      const dateText = dateInText ? dateInText[0] : $(h).text().trim();
+      const publishedAt = parseDateLoose(dateText);
+      const title = `Board of Trustees ${text.replace(/\s+/g,' ').trim()}`;
+      items.push(normItem({ source: 'Board of Trustees', title, link: abs, dateText, publishedAt }));
+    });
+  });
+
+  const ded = dedupe(items);
+  // Trustees publish agendas/minutes on/after the meeting date; filter by lookback
+  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  d('trustees found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
+  return fresh.slice(0, 8);
+}
+
+// ========== summarise + post ==========
 function titleLine() {
-  const nowUTC = new Date().toLocaleDateString('en-US', { timeZone: 'UTC' });
-  return `**SMC Updates — ${nowUTC} (UTC)**`;
+  const nowLA = new Date().toLocaleString('en-US', { timeZone: LA_TZ, month:'short', day:'2-digit', year:'numeric' });
+  return `**SMC Digest — ${nowLA} (${LA_TZ})**`;
 }
 
 async function summarize(items) {
   const pick = items.slice(0, MAX_ITEMS);
   if (pick.length === 0) return [];
 
-  const lines = pick.map(
-    (it, i) => `(${i + 1}) ${it.title}\nSource: ${it.source}\nLink: ${it.link}`
-  ).join('\n\n');
+  // Build a compact list for the LLM
+  const lines = pick.map((it, i) => `(${i + 1}) [${it.source}] ${it.title}\nLink: ${it.link}\nWhen: ${it.dateText || (it.publishedAt ? new Date(it.publishedAt).toDateString() : '')}`)
+                    .join('\n\n');
 
-  const prompt = `
-Summarize each item for SMC students in ONE short sentence (include what/where/when if present).
-Return ONLY bullets in this exact format:
-- [Title](Link) — concise why/when/where.
+  const prompt = `\nSummarize each item for SMC students in ONE short sentence.\nUse EXACTLY this format for each bullet (one per line):\n- [${'{Title}'}](${ '{Link}' }) — what/why/when (keep it tight).\nIf a date is known, include it succinctly (e.g., Sep 20, 9am).\n\nItems to summarize (with source, link, and when):\n${lines}\n`.trim();
 
-Items:
-${lines}
-`.trim();
+  // If OPENAI missing, fall back to raw bullets with links
+  if (!openai) {
+    return pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
+  }
 
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
-    temperature: 0.4,
-    max_tokens: 350,
+    temperature: 0.3,
+    max_tokens: 400,
     messages: [
-      { role: 'system', content: 'You write concise campus bulletins for SMC students.' },
+      { role: 'system', content: 'You write concise campus bulletins for SMC students. Be factual and brief.' },
       { role: 'user', content: prompt }
     ]
   });
 
   const text = resp.choices?.[0]?.message?.content?.trim() || '';
-  return text
-    ? text.split('\n').filter(l => l.trim().startsWith('-'))
-    : pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
+  const bullets = text.split('\n').map(s=>s.trim()).filter(l => l.startsWith('-'));
+  if (bullets.length) return bullets;
+
+  // Fallback fallback
+  return pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
 }
 
 async function postToDiscord(title, bullets) {
@@ -222,38 +417,57 @@ async function postToDiscord(title, bullets) {
   if (!res.ok) throw new Error(`Webhook post failed: ${res.status} ${await res.text()}`);
 }
 
-// ---------- main ----------
+// ========== main ==========
 (async () => {
   const client = HAS_DB ? await pool.connect() : null;
   try {
     await ensureTables();
 
-    const [news, events] = await Promise.all([
+    const results = await Promise.all([
       scrapeNewsroom().catch(e => { console.log('Newsroom scrape error:', e.message); return []; }),
-      scrapeEvents().catch(e => { console.log('Events scrape error:', e.message); return []; })
+      scrapeHomeEvents().catch(e => { console.log('Events scrape error:', e.message); return []; }),
+      scrapeCorsair().catch(e => { console.log('Corsair scrape error:', e.message); return []; }),
+      scrapeInFocus().catch(e => { console.log('In Focus scrape error:', e.message); return []; }),
+      scrapeTrustees().catch(e => { console.log('Trustees scrape error:', e.message); return []; }),
     ]);
 
-    const fresh = [];
-    for (const it of [...news, ...events]) {
-      if (!(await seen(it.link))) fresh.push(it);
-    }
-    if (fresh.length === 0) {
-      console.log('ℹ️ No new SMC items to post.');
+    // Flatten, normalize, dedupe
+    let all = results.flat().map(normItem);
+
+    // Global dedupe by URL
+    all = dedupe(all);
+
+    // Sort by recency
+    all.sort((a, b) => (new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0)));
+
+    // Cap per-source to avoid one outlet flooding the digest
+    all = limitPerSource(all, PER_SOURCE_LIMIT);
+
+    // Final shortlist
+    const shortlist = all.slice(0, MAX_ITEMS);
+
+    if (shortlist.length === 0) {
+      console.log('ℹ️ No fresh SMC items to post.');
       return;
     }
-    d('fresh items before summarize:', fresh.length);
+
+    d('shortlist:', shortlist.map(x => ({ src: x.source, title: x.title, when: x.dateText || x.publishedAt })).slice(0,10));
 
     let bullets;
     try {
-      bullets = await summarize(fresh);
+      bullets = await summarize(shortlist);
     } catch (e) {
       console.log('OpenAI unavailable, fallback to raw titles:', e.message);
-      bullets = fresh.slice(0, MAX_ITEMS).map(it => `- [${it.title}](${it.link}) — ${it.source}`);
+      bullets = shortlist.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
     }
+
     const finalBullets = bullets.slice(0, MAX_ITEMS);
 
     await postToDiscord(titleLine(), finalBullets);
-    for (const it of fresh.slice(0, MAX_ITEMS)) await mark(it.link, it.title);
+
+    // mark seen
+    for (const it of shortlist) await mark(it);
+
     console.log(`✅ Posted SMC digest with ${finalBullets.length} items.`);
   } catch (e) {
     console.error('❌ SMC job failed:', e);
