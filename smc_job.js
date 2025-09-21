@@ -4,6 +4,8 @@ import OpenAI from 'openai';
 import pg from 'pg';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
+import { createHash } from 'crypto';
+import fs from 'fs';
 
 // ---------- env ----------
 const NEWS_URL    = process.env.SMC_NEWS_URL    || 'https://www.smc.edu/news/';
@@ -13,24 +15,27 @@ const CORSAIR_URL = process.env.SMC_CORSAIR_URL || 'https://www.thecorsaironline
 const IN_FOCUS_URL= process.env.SMC_IN_FOCUS_URL|| 'https://www.smc.edu/news/in-focus/';
 const TRUSTEES_URL= process.env.SMC_TRUSTEES_URL|| 'https://admin.smc.edu/administration/governance/board-of-trustees/meetings.php';
 const ANNOUNCEMENTS_URL = process.env.SMC_ANNOUNCEMENTS_URL || 'https://www.smc.edu/news/announcements/';
-
 const WEBHOOK    = (process.env.SMC_WEBHOOK_URL || '').trim();
 const MAX_ITEMS  = Number(process.env.SMC_MAX_ITEMS || 6);
-const LOOKBACK_H = Number(process.env.SMC_LOOKBACK_HOURS || 72); // 3 days default
+const LOOKBACK_H = Number(process.env.SMC_LOOKBACK_HOURS || 72); // Fixed default to 72 hours
 const PER_SOURCE_LIMIT = Number(process.env.SMC_PER_SOURCE_LIMIT || 4);
-const EVENT_PAST_GRACE_H = Number(process.env.SMC_EVENT_PAST_GRACE_HOURS || 12); // keep just-started events within N hours
-const EVENT_FUTURE_WINDOW_D = Number(process.env.SMC_EVENT_FUTURE_WINDOW_DAYS || 60); // look ahead window
+const EVENT_PAST_GRACE_H = Number(process.env.SMC_EVENT_PAST_GRACE_HOURS || 12);
+const EVENT_FUTURE_WINDOW_D = Number(process.env.SMC_EVENT_FUTURE_WINDOW_DAYS || 60);
+const MIN_HOURS_BETWEEN_POSTS = Number(process.env.SMC_MIN_HOURS_BETWEEN_POSTS || 6); // Rate limiting
 const DEBUG = process.env.SMC_DEBUG === '1';
-const SEED  = process.env.SMC_SEED === '1'; // for testing, bypass date filters
-function d(...a){ if (DEBUG) console.log('[SMC]', ...a); }
+const SEED  = process.env.SMC_SEED === '1';
 
+// Rate limiting file
+const LAST_POST_FILE = './last-post-time.txt';
+
+function d(...a){ if (DEBUG) console.log('[SMC]', ...a); }
 if (!WEBHOOK) throw new Error('SMC_WEBHOOK_URL is required');
 
 // OpenAI (trim key to avoid bad header errors)
 const OPENAI_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
 
-// ---------- optional DB for dedupe ----------
+// ---------- database setup with enhanced deduplication ----------
 const HAS_DB = !!process.env.DATABASE_URL;
 let pool = null;
 if (HAS_DB) {
@@ -38,36 +43,147 @@ if (HAS_DB) {
     connectionString: process.env.DATABASE_URL,
     ssl: { require: true, rejectUnauthorized: false },
   });
+  console.log('✅ Database connected');
 } else {
-  d('No DATABASE_URL — using in-memory dedupe for this run.');
+  console.log('❌ No database - using memory only (not recommended for production)');
 }
+
 const memSeen = new Set();
+
 async function ensureTables() {
   if (!HAS_DB) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS smc_digest_log (
-      id SERIAL PRIMARY KEY,
-      url TEXT UNIQUE,
-      title TEXT,
-      source TEXT,
-      published_at TIMESTAMPTZ,
-      posted_at TIMESTAMPTZ DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS smc_digest_log_published_idx ON smc_digest_log (published_at DESC);
-  `);
+  
+  try {
+    // Test database connection
+    const testResult = await pool.query('SELECT NOW() as current_time');
+    console.log('✅ Database test successful:', testResult.rows[0].current_time);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS smc_digest_log (
+        id SERIAL PRIMARY KEY,
+        url TEXT UNIQUE,
+        title TEXT,
+        source TEXT,
+        published_at TIMESTAMPTZ,
+        posted_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS smc_digest_log_published_idx ON smc_digest_log (published_at DESC);
+      
+      CREATE TABLE IF NOT EXISTS smc_posted_content (
+        id SERIAL PRIMARY KEY,
+        content_hash TEXT UNIQUE,
+        title_preview TEXT,
+        posted_at TIMESTAMPTZ DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS smc_posted_content_time_idx ON smc_posted_content (posted_at DESC);
+    `);
+    console.log('✅ Database tables ready');
+  } catch (error) {
+    console.error('❌ Database setup failed:', error.message);
+    throw error;
+  }
 }
+
 async function seen(url) {
   if (!HAS_DB) return memSeen.has(url);
-  const { rows } = await pool.query(`SELECT 1 FROM smc_digest_log WHERE url=$1`, [url]);
-  return rows.length > 0;
+  try {
+    const { rows } = await pool.query(`SELECT 1 FROM smc_digest_log WHERE url=$1`, [url]);
+    return rows.length > 0;
+  } catch (error) {
+    console.error('Database error in seen():', error.message);
+    return false;
+  }
 }
+
 async function mark({url, title, source, publishedAt}) {
-  if (!HAS_DB) { memSeen.add(url); return; }
-  await pool.query(
-    `INSERT INTO smc_digest_log (url, title, source, published_at)
-     VALUES ($1,$2,$3,$4) ON CONFLICT (url) DO NOTHING`,
-    [url, title || null, source || null, publishedAt ? new Date(publishedAt) : null]
-  );
+  if (!HAS_DB) { 
+    memSeen.add(url); 
+    return; 
+  }
+  try {
+    await pool.query(
+      `INSERT INTO smc_digest_log (url, title, source, published_at)
+       VALUES ($1,$2,$3,$4) ON CONFLICT (url) DO NOTHING`,
+      [url, title || null, source || null, publishedAt ? new Date(publishedAt) : null]
+    );
+  } catch (error) {
+    console.error('Database error in mark():', error.message);
+  }
+}
+
+// Enhanced content deduplication
+function generateContentHash(bullets) {
+  const content = bullets.map(b => 
+    b.replace(/\[.*?\]\(.*?\)/g, '') // Remove markdown links
+     .replace(/[^\w\s]/g, '') // Remove punctuation
+     .toLowerCase()
+     .trim()
+  ).join('|');
+  return createHash('sha256').update(content).digest('hex').substring(0, 16);
+}
+
+async function hasPostedSimilarContent(bullets) {
+  if (!HAS_DB) return false;
+  try {
+    const hash = generateContentHash(bullets);
+    const { rows } = await pool.query(
+      `SELECT title_preview FROM smc_posted_content 
+       WHERE content_hash=$1 AND posted_at > NOW() - INTERVAL '24 hours'`,
+      [hash]
+    );
+    if (rows.length > 0) {
+      console.log('🔄 Similar content found:', rows[0].title_preview);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('Database error in hasPostedSimilarContent():', error.message);
+    return false;
+  }
+}
+
+async function markContentAsPosted(bullets) {
+  if (!HAS_DB) return;
+  try {
+    const hash = generateContentHash(bullets);
+    const preview = bullets[0]?.substring(0, 100) || 'No content';
+    await pool.query(
+      `INSERT INTO smc_posted_content (content_hash, title_preview) 
+       VALUES ($1, $2) ON CONFLICT (content_hash) DO NOTHING`,
+      [hash, preview]
+    );
+  } catch (error) {
+    console.error('Database error in markContentAsPosted():', error.message);
+  }
+}
+
+// Rate limiting check
+function checkRateLimit() {
+  if (!fs.existsSync(LAST_POST_FILE)) {
+    return true; // First run
+  }
+  
+  try {
+    const lastPostTime = new Date(fs.readFileSync(LAST_POST_FILE, 'utf8'));
+    const hoursSince = (Date.now() - lastPostTime.getTime()) / (1000 * 60 * 60);
+    
+    if (hoursSince < MIN_HOURS_BETWEEN_POSTS) {
+      console.log(`⏰ Rate limit: Only ${hoursSince.toFixed(1)} hours since last post (need ${MIN_HOURS_BETWEEN_POSTS})`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.log('⚠️ Could not read last post time, proceeding');
+    return true;
+  }
+}
+
+function updateLastPostTime() {
+  try {
+    fs.writeFileSync(LAST_POST_FILE, new Date().toISOString());
+  } catch (error) {
+    console.error('Could not update last post time:', error.message);
+  }
 }
 
 // ---------- helpers ----------
@@ -103,10 +219,16 @@ async function getHTML(url) {
 }
 
 function hoursAgo(h) { return Date.now() - h * 3600 * 1000; }
+
 function isFresh(dateOrNull) {
   if (SEED) return true;
-  if (!dateOrNull) return false; // IMPORTANT: no date means NOT fresh (fixes old posts slipping in)
-  return new Date(dateOrNull).getTime() >= hoursAgo(LOOKBACK_H);
+  if (!dateOrNull) {
+    d('❌ No date provided, treating as NOT fresh');
+    return false; // IMPORTANT: no date means NOT fresh
+  }
+  const isFreshResult = new Date(dateOrNull).getTime() >= hoursAgo(LOOKBACK_H);
+  d(`📅 Date check: ${dateOrNull} -> ${isFreshResult ? 'FRESH' : 'OLD'} (lookback: ${LOOKBACK_H}h)`);
+  return isFreshResult;
 }
 
 function normItem(it) {
@@ -148,7 +270,6 @@ async function scrapeNewsroom() {
   const html = await getHTML(NEWS_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   $('article a, li a, h2 a, h3 a, div a, section a, a').each((_, el) => {
     const a = $(el);
     const href  = a.attr('href') || '';
@@ -159,7 +280,6 @@ async function scrapeNewsroom() {
     if (!/smc\.edu/i.test(abs)) return;
     if (!(p.includes('/news') || p.includes('/newsroom'))) return;
     if (/\/index(\.php)?$/.test(p)) return;
-
     const bloc = a.closest('article,li,div,section');
     const dateText = bloc.find('time').attr('datetime')
                    || bloc.find('time').first().text()
@@ -168,14 +288,12 @@ async function scrapeNewsroom() {
     const publishedAt = parseDateLoose(dateText);
     items.push(normItem({ source: 'SMC Newsroom', title, link: abs, dateText, publishedAt }));
   });
-
   for (const it of items) {
     if (!it.publishedAt) {
       const detected = await detectPublishedFromPage(it.link);
       if (detected) it.publishedAt = detected;
     }
   }
-
   const ded = dedupe(items);
   const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
   d('newsroom found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
@@ -187,10 +305,8 @@ async function scrapeHomeEvents() {
   const html = await getHTML(HOME_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   const header = $('*:contains("Events Happening at SMC")').filter((_, el) => $(el).text().trim() === 'Events Happening at SMC').first();
   const scope = header.length ? header.closest('section,div').parent() : $.root();
-
   scope.find('a').each((_, el) => {
     const a = $(el);
     const title = a.text().replace(/\s+/g, ' ').trim();
@@ -205,18 +321,16 @@ async function scrapeHomeEvents() {
       items.push(normItem({ source: 'SMC Events', title, link: abs, dateText: dateLine||'', publishedAt: start }));
     }
   });
-
   const ded = dedupe(items);
   d('home events kept (upcoming/recent):', ded.length);
   return ded.slice(0, 12);
 }
 
-// 3) The Corsair (student newspaper)
+// 3) The Corsair (student newspaper) - with enhanced freshness checking
 async function scrapeCorsair() {
   const html = await getHTML(CORSAIR_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   $('a').each((_, el) => {
     const a = $(el);
     const href = a.attr('href') || '';
@@ -231,16 +345,24 @@ async function scrapeCorsair() {
     const publishedAt = parseDateLoose(dateText);
     if (title.length > 6) items.push(normItem({ source: 'The Corsair', title, link: abs, dateText, publishedAt }));
   });
-
+  
+  // Enhanced date detection for Corsair articles
   for (const it of items) {
     if (!it.publishedAt) {
       const detected = await detectPublishedFromPage(it.link);
       if (detected) it.publishedAt = detected;
     }
   }
-
+  
   const ded = dedupe(items);
-  const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
+  const fresh = SEED ? ded : ded.filter(it => {
+    const isFreshResult = isFresh(it.publishedAt);
+    if (!isFreshResult) {
+      d(`🗞️ Corsair article filtered out (too old): ${it.title} - ${it.publishedAt}`);
+    }
+    return isFreshResult;
+  });
+  
   d('corsair found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
   return fresh.slice(0, 12);
 }
@@ -250,7 +372,6 @@ async function scrapeInFocus() {
   const html = await getHTML(IN_FOCUS_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   let issueDate = null;
   $('*:contains("Volume ")').each((_, el) => {
     const t = $(el).text();
@@ -258,7 +379,6 @@ async function scrapeInFocus() {
     if (m) { issueDate = m[0]; return false; }
   });
   const issueDt = parseDateLoose(issueDate);
-
   $('a:contains("Read Article"), h2 a, .newsfeed-title a, .feature a').each((_, el) => {
     const a = $(el);
     const href = a.attr('href');
@@ -268,14 +388,12 @@ async function scrapeInFocus() {
     if (!title) return;
     items.push(normItem({ source: 'SMC In Focus', title, link: abs, dateText: issueDate || '', publishedAt: issueDt }));
   });
-
   for (const it of items) {
     if (!it.publishedAt) {
       const detected = await detectPublishedFromPage(it.link);
       if (detected) it.publishedAt = detected;
     }
   }
-
   const ded = dedupe(items);
   const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
   d('in-focus found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
@@ -287,7 +405,6 @@ async function scrapeTrustees() {
   const html = await getHTML(TRUSTEES_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   const yearHeaders = $('h3:contains("2025"), h3:contains("2024"), h2:contains("2025"), h2:contains("2024")');
   yearHeaders.each((_, h) => {
     const yearBlock = $(h).nextUntil('h3, h2');
@@ -303,7 +420,6 @@ async function scrapeTrustees() {
       items.push(normItem({ source: 'Board of Trustees', title: `Board of Trustees ${text.replace(/\s+/g,' ').trim()}` , link: abs, dateText, publishedAt }));
     });
   });
-
   const ded = dedupe(items);
   const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
   d('trustees found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
@@ -315,7 +431,6 @@ async function scrapeAnnouncements() {
   const html = await getHTML(ANNOUNCEMENTS_URL);
   const $ = cheerio.load(html);
   const items = [];
-
   $('article a, h2 a, h3 a, li a').each((_, el) => {
     const a = $(el);
     const href = a.attr('href') || '';
@@ -328,14 +443,12 @@ async function scrapeAnnouncements() {
     let publishedAt = parseDateLoose(dateText);
     items.push(normItem({ source: 'SMC Announcements', title, link: abs, dateText, publishedAt }));
   });
-
   for (const it of items) {
     if (!it.publishedAt) {
       const detected = await detectPublishedFromPage(it.link);
       if (detected) it.publishedAt = detected;
     }
   }
-
   const ded = dedupe(items);
   const fresh = SEED ? ded : ded.filter(it => isFresh(it.publishedAt));
   d('announcements found:', items.length, 'deduped:', ded.length, 'fresh:', fresh.length);
@@ -401,10 +514,8 @@ async function detectPublishedFromPage(url, htmlCache) {
   try {
     const html = htmlCache || await getHTML(url);
     const $ = cheerio.load(html);
-
     const timeDT = $('time[datetime]').attr('datetime') || $('time').first().text();
     let dt = parseDateLoose(timeDT);
-
     if (!dt) {
       const meta = $('meta[property="article:published_time"]').attr('content')
               || $('meta[name="pubdate"]').attr('content')
@@ -412,7 +523,6 @@ async function detectPublishedFromPage(url, htmlCache) {
               || $('meta[name="date"]').attr('content');
       dt = parseDateLoose(meta);
     }
-
     if (!dt) {
       $('script[type="application/ld+json"]').each((_, el) => {
         try {
@@ -433,16 +543,12 @@ async function detectPublishedFromPage(url, htmlCache) {
 async function summarize(items) {
   const pick = items.slice(0, MAX_ITEMS);
   if (pick.length === 0) return [];
-
   const lines = pick.map((it, i) => `(${i + 1}) [${it.source}] ${it.title}\nLink: ${it.link}\nWhen: ${it.dateText || (it.publishedAt ? new Date(it.publishedAt).toDateString() : '')}`)
                     .join('\n\n');
-
   const prompt = `\nSummarize each item for SMC students in ONE short sentence.\nUse EXACTLY this format for each bullet (one per line):\n- [${'{Title}'}](${ '{Link}' }) — what/why/when (keep it tight).\nIf a date is known, include it succinctly (e.g., Sep 20, 9am).\n\nItems to summarize (with source, link, and when):\n${lines}\n`.trim();
-
   if (!openai) {
     return pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
   }
-
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     temperature: 0.3,
@@ -452,11 +558,9 @@ async function summarize(items) {
       { role: 'user', content: prompt }
     ]
   });
-
   const text = resp.choices?.[0]?.message?.content?.trim() || '';
   const bullets = text.split('\n').map(s=>s.trim()).filter(l => l.startsWith('-'));
   if (bullets.length) return bullets;
-
   return pick.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
 }
 
@@ -474,45 +578,91 @@ async function postToDiscord(title, bullets) {
 (async () => {
   const client = HAS_DB ? await pool.connect() : null;
   try {
+    console.log(`🤖 SMC Digest Bot starting... (lookback: ${LOOKBACK_H}h, seed: ${SEED})`);
+    
+    // Rate limiting check
+    if (!SEED && !checkRateLimit()) {
+      console.log('⏰ Skipping run due to rate limit');
+      return;
+    }
+    
     await ensureTables();
-
+    
     const results = await Promise.all([
-      scrapeNewsroom().catch(e => { console.log('Newsroom scrape error:', e.message); return []; }),
-      scrapeEventsTimeAware().catch(e => { console.log('Events scrape error:', e.message); return []; }),
-      scrapeCorsair().catch(e => { console.log('Corsair scrape error:', e.message); return []; }),
-      scrapeInFocus().catch(e => { console.log('In Focus scrape error:', e.message); return []; }),
-      scrapeTrustees().catch(e => { console.log('Trustees scrape error:', e.message); return []; }),
-      scrapeAnnouncements().catch(e => { console.log('Announcements scrape error:', e.message); return []; }),
+      scrapeNewsroom().catch(e => { console.log('❌ Newsroom scrape error:', e.message); return []; }),
+      scrapeEventsTimeAware().catch(e => { console.log('❌ Events scrape error:', e.message); return []; }),
+      scrapeCorsair().catch(e => { console.log('❌ Corsair scrape error:', e.message); return []; }),
+      scrapeInFocus().catch(e => { console.log('❌ In Focus scrape error:', e.message); return []; }),
+      scrapeTrustees().catch(e => { console.log('❌ Trustees scrape error:', e.message); return []; }),
+      scrapeAnnouncements().catch(e => { console.log('❌ Announcements scrape error:', e.message); return []; }),
     ]);
-
+    
     let all = results.flat().map(normItem);
     all = dedupe(all);
     all.sort((a, b) => (new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0)));
     all = limitPerSource(all, PER_SOURCE_LIMIT);
-
+    
     const shortlist = all.slice(0, MAX_ITEMS);
+    
     if (shortlist.length === 0) {
       console.log('ℹ️ No fresh SMC items to post.');
       return;
     }
-
+    
     d('shortlist:', shortlist.map(x => ({ src: x.source, title: x.title, when: x.dateText || x.publishedAt })).slice(0,10));
-
+    
+    // Check for duplicate content before proceeding
     let bullets;
     try {
       bullets = await summarize(shortlist);
     } catch (e) {
-      console.log('OpenAI unavailable, fallback to raw titles:', e.message);
+      console.log('❌ OpenAI unavailable, fallback to raw titles:', e.message);
       bullets = shortlist.map(it => `- [${it.title}](${it.link}) — ${it.source}`);
     }
-
+    
     const finalBullets = bullets.slice(0, MAX_ITEMS);
-
-    await postToDiscord(titleLine(), finalBullets);
-
+    
+    // Enhanced duplicate content check
+    if (await hasPostedSimilarContent(finalBullets)) {
+      console.log('🔄 Similar content posted recently, skipping to avoid spam');
+      return;
+    }
+    
+    // Additional title-based deduplication check
+    const recentTitles = new Set();
+    const uniqueBullets = [];
+    for (const bullet of finalBullets) {
+      const titleMatch = bullet.match(/\[(.*?)\]/);
+      if (titleMatch) {
+        const titleKey = titleMatch[1].toLowerCase().substring(0, 50);
+        if (!recentTitles.has(titleKey)) {
+          recentTitles.add(titleKey);
+          uniqueBullets.push(bullet);
+        } else {
+          console.log('🔄 Skipping likely duplicate title:', titleMatch[1]);
+        }
+      } else {
+        uniqueBullets.push(bullet);
+      }
+    }
+    
+    if (uniqueBullets.length === 0) {
+      console.log('🔄 All content appears to be duplicates, skipping post');
+      return;
+    }
+    
+    // Post to Discord
+    await postToDiscord(titleLine(), uniqueBullets);
+    
+    // Mark content as posted and update rate limiting
+    await markContentAsPosted(uniqueBullets);
+    updateLastPostTime();
+    
+    // Mark individual items as seen
     for (const it of shortlist) await mark(it);
-
-    console.log(`✅ Posted SMC digest with ${finalBullets.length} items.`);
+    
+    console.log(`✅ Posted SMC digest with ${uniqueBullets.length} items.`);
+    
   } catch (e) {
     console.error('❌ SMC job failed:', e);
     process.exitCode = 1;
