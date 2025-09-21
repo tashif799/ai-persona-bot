@@ -464,9 +464,9 @@ No extra text.`
 
 function wittyCallout(tone) {
   const lines = [];
-  if (tone.passive_aggressive) lines.push('😏 That's a bit passive-aggressive, don't you think?');
-  if (tone.condescending)      lines.push('🪜 Climb down from that high horse—talk to people, not at them.');
-  if (tone.provocation)        lines.push('🧯 Chill—no need to pour fuel on the thread.');
+  if (tone.passive_aggressive) lines.push('😏 That\'s a bit passive-aggressive, don\'t you think?');
+  if (tone.condescending) lines.push('🪜 Climb down from that high horse—talk to people, not at them.');
+  if (tone.provocation) lines.push('🧯 Chill—no need to pour fuel on the thread.');
   return lines.join(' ');
 }
 
