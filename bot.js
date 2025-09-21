@@ -18,6 +18,18 @@ import {
   getRecentIncidents,
   getUserBehaviorSummary,
   getTopSuspects,
+  // New database functions
+  saveConversationMessage,
+  getConversationHistory,
+  updateUserProfile,
+  getUserProfile,
+  updateChannelActivity,
+  getInactiveChannels,
+  recordAutoStarter,
+  saveConversationStarter,
+  getRandomStarter,
+  recordStarterUsage,
+  runDailyCleanup
 } from './db.js';
 
 // ---------- load persona ----------
@@ -40,13 +52,10 @@ const OWNER_ID = process.env.OWNER_ID?.trim();
 const PERSONA_ID = 'kmwyl';
 const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
 
-// ---------- new conversation & auto-starter state ----------
-const conversationHistory = new Map(); // channelId -> array of {role, content, timestamp, userId}
-const lastChannelActivity = new Map(); // channelId -> timestamp
+// ---------- conversation & auto-starter constants ----------
 const MAX_CONVERSATION_LENGTH = 20; // keep last 20 messages for context
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const AUTO_STARTER_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
-const userProfiles = new Map(); // userId -> {age?, gender?, interests: [], flirtyLevel: number}
 
 // ---------- moderation state (existing) ----------
 const strikes = new Map();
@@ -60,45 +69,27 @@ const activeConvos = new Map();
 const lastToneReply = new Map();
 const TONE_COOLDOWN_MS = 5000;
 
-// ---------- conversation memory helpers ----------
-function addToConversationHistory(channelId, role, content, userId = null) {
-  if (!conversationHistory.has(channelId)) {
-    conversationHistory.set(channelId, []);
+// ---------- enhanced conversation memory with database ----------
+async function getConversationContext(channelId) {
+  try {
+    const history = await getConversationHistory({ 
+      channelId, 
+      limit: MAX_CONVERSATION_LENGTH, 
+      maxAgeHours: CONVERSATION_TIMEOUT_MS / (1000 * 60 * 60) 
+    });
+    
+    // Convert to OpenAI format
+    return history.map(msg => ({
+      role: msg.role,
+      content: msg.content
+    }));
+  } catch (error) {
+    console.error('Failed to get conversation context:', error);
+    return [];
   }
-  
-  const history = conversationHistory.get(channelId);
-  history.push({
-    role,
-    content,
-    timestamp: Date.now(),
-    userId
-  });
-  
-  // Keep only recent messages
-  if (history.length > MAX_CONVERSATION_LENGTH) {
-    history.shift();
-  }
-  
-  conversationHistory.set(channelId, history);
 }
 
-function getConversationContext(channelId) {
-  const history = conversationHistory.get(channelId) || [];
-  const now = Date.now();
-  
-  // Filter out old messages
-  const recentHistory = history.filter(msg => 
-    (now - msg.timestamp) < CONVERSATION_TIMEOUT_MS
-  );
-  
-  // Convert to OpenAI format
-  return recentHistory.map(msg => ({
-    role: msg.role,
-    content: msg.content
-  }));
-}
-
-// ---------- user profiling & flirty behavior ----------
+// ---------- user profiling & flirty behavior with database ----------
 async function analyzeUserProfile(message, userId) {
   try {
     const resp = await openai.chat.completions.create({
@@ -122,22 +113,34 @@ Base this on writing style, topics, slang, references, etc. Be conservative with
     
     const analysis = JSON.parse(resp.choices[0].message.content);
     
-    // Update user profile
-    const existing = userProfiles.get(userId) || { interests: [], traits: [], flirtyLevel: 0 };
+    // Get existing profile from database
+    const existingProfile = await getUserProfile(userId) || { 
+      interests: [], 
+      traits: [], 
+      flirty_level: 0 
+    };
     
-    existing.age_range = analysis.age_range;
-    existing.gender_likely = analysis.gender_likely;
-    existing.interests = [...new Set([...existing.interests, ...analysis.interests])];
-    existing.traits = [...new Set([...existing.traits, ...analysis.personality_traits])];
+    // Merge new analysis with existing data
+    const updatedInterests = [...new Set([...existingProfile.interests, ...analysis.interests])];
+    const updatedTraits = [...new Set([...existingProfile.traits, ...analysis.personality_traits])];
     
-    // Adjust flirty level based on appropriateness and interaction
+    // Adjust flirty level based on appropriateness
+    let newFlirtyLevel = existingProfile.flirty_level;
     if (analysis.flirty_appropriate && (analysis.age_range === '18_25' || analysis.age_range === '26_35' || analysis.age_range === '35_plus')) {
-      existing.flirtyLevel = Math.min(existing.flirtyLevel + 0.1, 1.0);
+      newFlirtyLevel = Math.min(newFlirtyLevel + 0.1, 1.0);
     }
     
-    userProfiles.set(userId, existing);
+    // Update profile in database
+    await updateUserProfile({
+      userId,
+      ageRange: analysis.age_range,
+      genderLikely: analysis.gender_likely,
+      interests: updatedInterests,
+      traits: updatedTraits,
+      flirtyLevel: newFlirtyLevel
+    });
     
-    // Remember interesting traits
+    // Remember interesting traits in user memory
     if (analysis.personality_traits.length > 0) {
       await rememberUserQuirk(userId, `Traits: ${analysis.personality_traits.join(', ')}`);
     }
@@ -147,34 +150,48 @@ Base this on writing style, topics, slang, references, etc. Be conservative with
   }
 }
 
-function getPersonalityModifier(userId) {
-  const profile = userProfiles.get(userId);
-  if (!profile) return '';
-  
-  let modifier = '';
-  
-  // Add flirty behavior for appropriate users
-  if (profile.flirtyLevel > 0.3 && profile.age_range !== 'under_18' && profile.age_range !== 'unknown') {
-    const flirtyLevel = Math.min(profile.flirtyLevel, 0.8); // Cap it
-    modifier += `Be subtly flirty and charming (level: ${Math.round(flirtyLevel * 10)}/10). `;
+async function getPersonalityModifier(userId) {
+  try {
+    const profile = await getUserProfile(userId);
+    if (!profile) return '';
+    
+    let modifier = '';
+    
+    // Add flirty behavior for appropriate users
+    if (profile.flirty_level > 0.3 && profile.age_range !== 'under_18' && profile.age_range !== 'unknown') {
+      const flirtyLevel = Math.min(profile.flirty_level, 0.8); // Cap it
+      modifier += `Be subtly flirty and charming (level: ${Math.round(flirtyLevel * 10)}/10). `;
+    }
+    
+    // Adapt to interests
+    if (profile.interests && profile.interests.length > 0) {
+      modifier += `User interests: ${profile.interests.slice(0, 3).join(', ')}. `;
+    }
+    
+    // Adapt to personality
+    if (profile.traits && profile.traits.length > 0) {
+      modifier += `User traits: ${profile.traits.slice(0, 3).join(', ')}. `;
+    }
+    
+    return modifier;
+  } catch (error) {
+    console.error('Failed to get personality modifier:', error);
+    return '';
   }
-  
-  // Adapt to interests
-  if (profile.interests.length > 0) {
-    modifier += `User interests: ${profile.interests.slice(0, 3).join(', ')}. `;
-  }
-  
-  // Adapt to personality
-  if (profile.traits.length > 0) {
-    modifier += `User traits: ${profile.traits.slice(0, 3).join(', ')}. `;
-  }
-  
-  return modifier;
 }
 
-// ---------- tech news & conversation starters ----------
+// ---------- tech news & conversation starters with database ----------
 async function getTechTrends() {
   try {
+    // Try to get a stored starter from database first
+    const storedStarter = await getRandomStarter('tech', 3);
+    
+    if (storedStarter && Math.random() > 0.3) { // 70% chance to use stored starter
+      await recordStarterUsage(storedStarter.id);
+      return storedStarter.content;
+    }
+    
+    // Generate new starter
     const resp = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
@@ -195,7 +212,16 @@ Keep it under 280 characters and naturally conversational.`
       ]
     });
     
-    return resp.choices[0].message.content.trim();
+    const newStarter = resp.choices[0].message.content.trim();
+    
+    // Save new starter to database for future use
+    await saveConversationStarter({ 
+      content: newStarter, 
+      category: 'tech', 
+      rating: 4 
+    });
+    
+    return newStarter;
   } catch (e) {
     console.error('Tech trends generation failed:', e);
     return "Anyone else notice how we went from 'don't trust anything on the internet' to 'hey Google, order my groceries'? Wild how fast we pivoted. What tech shift caught you most off guard?";
@@ -203,34 +229,49 @@ Keep it under 280 characters and naturally conversational.`
 }
 
 async function checkAndSendAutoStarter() {
-  const now = Date.now();
-  
-  for (const [channelId, lastActivity] of lastChannelActivity.entries()) {
-    const timeSinceActivity = now - lastActivity;
+  try {
+    const inactiveChannels = await getInactiveChannels(12); // 12 hours
     
-    if (timeSinceActivity >= AUTO_STARTER_COOLDOWN_MS) {
+    for (const channelData of inactiveChannels) {
       try {
-        const channel = await client.channels.fetch(channelId);
+        const channel = await client.channels.fetch(channelData.channel_id);
         if (!channel || channel.type !== 0) continue; // Only text channels
         
-        // Don't spam if bot was the last to speak
-        const history = conversationHistory.get(channelId) || [];
-        const lastMessage = history[history.length - 1];
-        if (lastMessage && lastMessage.role === 'assistant') continue;
+        // Check conversation history to avoid spamming if bot was last to speak
+        const recentHistory = await getConversationHistory({ 
+          channelId: channel.id, 
+          limit: 1, 
+          maxAgeHours: 1 
+        });
+        
+        if (recentHistory.length > 0 && recentHistory[recentHistory.length - 1].role === 'assistant') {
+          continue; // Skip if bot was last to speak
+        }
         
         const starter = await getTechTrends();
         await channel.send(starter);
         
-        // Update activity and add to conversation
-        lastChannelActivity.set(channelId, now);
-        addToConversationHistory(channelId, 'assistant', starter);
+        // Update database tracking
+        await updateChannelActivity(channel.id, channel.guildId);
+        await recordAutoStarter(channel.id);
+        
+        // Save to conversation history
+        await saveConversationMessage({
+          channelId: channel.id,
+          guildId: channel.guildId,
+          userId: null, // Bot message
+          role: 'assistant',
+          content: starter
+        });
         
         console.log(`Sent auto-starter to ${channel.name}: ${starter}`);
         
       } catch (e) {
-        console.error(`Failed to send auto-starter to channel ${channelId}:`, e);
+        console.error(`Failed to send auto-starter to channel ${channelData.channel_id}:`, e);
       }
     }
+  } catch (error) {
+    console.error('Auto-starter check failed:', error);
   }
 }
 
@@ -525,11 +566,11 @@ async function handleModeration(msg) {
   }
 }
 
-// ---------- enhanced conversation with memory ----------
+// ---------- enhanced conversation with database memory ----------
 async function chatWithAI(text, userId, channelId) {
   const quirks = await getUserQuirks(userId);
-  const personalityMod = getPersonalityModifier(userId);
-  const conversationContext = getConversationContext(channelId);
+  const personalityMod = await getPersonalityModifier(userId);
+  const conversationContext = await getConversationContext(channelId);
   
   const systemPrompt = `
 You are "${persona.display_name}" (${persona.pronouns}).
@@ -557,50 +598,64 @@ Use conversation context naturally but don't reference it explicitly unless rele
 async function handleConversation(msg) {
   const channelId = msg.channel.id;
   
-  // Update activity tracking
-  lastChannelActivity.set(channelId, Date.now());
+  // Update database activity tracking
+  await updateChannelActivity(channelId, msg.guildId);
   
-  // Add user message to conversation history
-  addToConversationHistory(channelId, 'user', msg.content, msg.author.id);
+  // Save user message to database
+  await saveConversationMessage({
+    channelId: msg.channelId,
+    guildId: msg.guildId,
+    userId: msg.author.id,
+    role: 'user',
+    content: msg.content
+  });
   
   // Analyze user for profiling
   await analyzeUserProfile(msg.content, msg.author.id);
   
   if (activeConvos.get(channelId) === 'off') return;
   
+  let reply = null;
+  
   if (/(mac|windows|linux)/i.test(msg.content)) {
     if (!activeConvos.has(channelId)) {
       activeConvos.set(channelId, 'pending');
-      const reply = '💻 Want me to join this debate? (yes/no)';
+      reply = '💻 Want me to join this debate? (yes/no)';
       await msg.reply(reply);
-      addToConversationHistory(channelId, 'assistant', reply);
       await rememberUserQuirk(msg.author.id, 'Started an OS debate');
     } else if (activeConvos.get(channelId) === 'on') {
-      const reply = await chatWithAI(msg.content, msg.author.id, channelId);
+      reply = await chatWithAI(msg.content, msg.author.id, channelId);
       await msg.reply(reply);
-      addToConversationHistory(channelId, 'assistant', reply);
     }
   }
   
   if (/stop yapping|no\b/i.test(msg.content.toLowerCase())) {
     activeConvos.set(channelId, 'off');
-    const reply = '🤐 Okay, I'll stay out.';
+    reply = '🤐 Okay, I'll stay out.';
     await msg.reply(reply);
-    addToConversationHistory(channelId, 'assistant', reply);
   }
   
   if (/yes|be part/i.test(msg.content.toLowerCase())) {
     activeConvos.set(channelId, 'on');
-    const reply = '😎 Cool, I'm in.';
+    reply = '😎 Cool, I'm in.';
     await msg.reply(reply);
-    addToConversationHistory(channelId, 'assistant', reply);
   }
   
   // Direct mentions or questions
   if (msg.mentions.has(client.user) || /^(hey|hi|hello).*kmwyl/i.test(msg.content)) {
-    const reply = await chatWithAI(msg.content, msg.author.id, channelId);
+    reply = await chatWithAI(msg.content, msg.author.id, channelId);
     await msg.reply(reply);
-    addToConversationHistory(channelId, 'assistant', reply);
+  }
+  
+  // Save bot reply to database if we replied
+  if (reply) {
+    await saveConversationMessage({
+      channelId: msg.channelId,
+      guildId: msg.guildId,
+      userId: null, // Bot message
+      role: 'assistant',
+      content: reply
+    });
   }
 }
 
@@ -687,105 +742,3 @@ client.on(Events.MessageCreate, async (msg) => {
       const target = msg.mentions.users.first();
       if (target) {
         shadowBanned.delete(target.id);
-        await msg.reply(`🌞 Un-shadowbanned ${target.username}.`);
-      }
-    }
-    
-    // New: User profile inspection
-    if (msg.content.startsWith('!profile')) {
-      const target = msg.mentions.users.first();
-      if (target) {
-        const profile = userProfiles.get(target.id);
-        if (profile) {
-          await msg.reply(
-            `👤 Profile for <@${target.id}>:\n` +
-            `• Age range: ${profile.age_range || 'unknown'}\n` +
-            `• Gender likely: ${profile.gender_likely || 'unknown'}\n` +
-            `• Flirty level: ${Math.round((profile.flirtyLevel || 0) * 10)}/10\n` +
-            `• Interests: ${profile.interests.slice(0, 5).join(', ') || 'none detected'}\n` +
-            `• Traits: ${profile.traits.slice(0, 5).join(', ') || 'none detected'}`
-          );
-        } else {
-          await msg.reply(`No profile data for <@${target.id}> yet.`);
-        }
-      }
-    }
-    
-    // New: Force conversation starter
-    if (msg.content === '!starter') {
-      const starter = await getTechTrends();
-      await msg.channel.send(starter);
-      lastChannelActivity.set(msg.channelId, Date.now());
-      addToConversationHistory(msg.channelId, 'assistant', starter);
-      await msg.reply('🚀 Conversation starter deployed!');
-    }
-    
-    // Existing SUS commands...
-    if (msg.content.startsWith('!sus ')) {
-      const m = msg.content.split(/\s+/);
-      const target = msg.mentions.users.first();
-      const hours = Number(m[m.length - 1]) || 24;
-      if (!target) return msg.reply('Usage: `!sus @user [hours]`');
-      const s = await getUserBehaviorSummary({ userId: target.id, hours });
-      await msg.reply(
-        `🕵️ Report for <@${target.id}> (last ${hours}h):\n` +
-        `• incidents: ${s.total || 0}\n` +
-        `• passive-aggr: ${s.passive_aggr || 0}\n` +
-        `• condescending: ${s.condescending || 0}\n` +
-        `• provocation: ${s.provocation || 0}\n` +
-        `• actions taken: ${s.actions || 0}`
-      );
-      return;
-    }
-    
-    if (msg.content.startsWith('!susrecent')) {
-      const parts = msg.content.split(/\s+/);
-      const hours = Number(parts[1]) || 24;
-      const limit = Number(parts[2]) || 10;
-      const rows = await getRecentIncidents({ guildId: msg.guildId, hours, limit });
-      if (!rows.length) return msg.reply(`No incidents in last ${hours}h.`);
-      const lines = rows.map(r =>
-        `• <@${r.user_id}> ${r.action_taken || 'none'} ` +
-        `${r.passive_aggr ? 'PA ' : ''}${r.condescending ? 'COND ' : ''}${r.provocation ? 'PROV ' : ''}`.trim()
-      );
-      await msg.reply(`🧾 Recent incidents (last ${hours}h):\n${lines.join('\n')}`);
-      return;
-    }
-    
-    if (msg.content.startsWith('!suswho')) {
-      const parts = msg.content.split(/\s+/);
-      const hours = Number(parts[1]) || 24;
-      const limit = Number(parts[2]) || 5;
-      const rows = await getTopSuspects({ guildId: msg.guildId, hours, limit });
-      if (!rows.length) return msg.reply(`Clean slate in last ${hours}h.`);
-      const lines = rows.map((r, i) =>
-        `${i+1}. <@${r.user_id}> — actions: ${r.actions}, tone flags: ${r.tone_flags}, incidents: ${r.incidents}`
-      );
-      await msg.reply(`🏴 Top suspects (last ${hours}h):\n${lines.join('\n')}`);
-      return;
-    }
-  }
-  
-  await handleModeration(msg);
-  await handleConversation(msg);
-  await handleAutoThreads(msg);
-});
-
-// ---------- startup & auto-starter loop ----------
-client.once(Events.ClientReady, () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  
-  // Set up auto-starter interval (check every 30 minutes)
-  setInterval(checkAndSendAutoStarter, 30 * 60 * 1000);
-  
-  // Initialize activity tracking for existing channels
-  client.guilds.cache.forEach(guild => {
-    guild.channels.cache
-      .filter(channel => channel.type === 0) // Text channels only
-      .forEach(channel => {
-        lastChannelActivity.set(channel.id, Date.now());
-      });
-  });
-});
-
-client.login(process.env.DISCORD_TOKEN);
