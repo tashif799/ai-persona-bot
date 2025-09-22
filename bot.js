@@ -68,6 +68,9 @@ const recentJoins = [];
 const activeConvos = new Map();
 const lastToneReply = new Map();
 const TONE_COOLDOWN_MS = 5000;
+// Enhanced moderation state
+const userModerationState = new Map(); // userId -> { warningCount, lastIncident, timeoutUntil }
+
 
 // ---------- enhanced conversation memory with database ----------
 async function getConversationContext(channelId) {
@@ -462,12 +465,101 @@ No extra text.`
   }
 }
 
-function wittyCallout(tone) {
-  const lines = [];
-  if (tone.passive_aggressive) lines.push('😏 That\'s a bit passive-aggressive, don\'t you think?');
-  if (tone.condescending) lines.push('🪜 Climb down from that high horse—talk to people, not at them.');
-  if (tone.provocation) lines.push('🧯 Chill—no need to pour fuel on the thread.');
-  return lines.join(' ');
+// Enhanced moderation with intelligent responses and timeout system
+async function generateContextualCallout(message, tone, userHistory) {
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: `You're a witty Discord moderator bot for a software development community. Generate a brief, clever response to problematic behavior. Guidelines:
+
+TONE ANALYSIS:
+- passive_aggressive: ${tone.passive_aggressive}
+- condescending: ${tone.condescending} 
+- provocation: ${tone.provocation}
+- toxicity: ${tone.toxicity}
+
+USER CONTEXT:
+- Previous warnings: ${userHistory.warningCount || 0}
+- Recent behavior pattern: ${userHistory.pattern || 'first incident'}
+
+RESPONSE STYLE:
+- Keep it under 100 characters
+- Be witty but not mean
+- Use relevant emoji (1-2 max)
+- Tech/coding references when appropriate
+- Escalate firmness based on repeat behavior
+- If high toxicity or repeat offender, suggest they take a break
+
+Generate ONE appropriate response for this specific situation.`
+        },
+        {
+          role: 'user', 
+          content: `Message: "${message}"\nGenerate appropriate callout response.`
+        }
+      ]
+    });
+    
+    return resp.choices[0].message.content.trim();
+  } catch (e) {
+    console.error('Failed to generate contextual callout:', e);
+    // Fallback to simple responses
+    if (tone.toxicity === 'high') return '🛑 That crossed a line. Let\'s keep this professional.';
+    if (tone.condescending) return '🪜 Climb down from that high horse—talk to people, not at them.';
+    if (tone.passive_aggressive) return '😏 That\'s a bit passive-aggressive, don\'t you think?';
+    if (tone.provocation) return '🧯 Chill—no need to pour fuel on the thread.';
+    return '⚠️ Let\'s keep things constructive here.';
+  }
+}
+
+function getUserModerationHistory(userId) {
+  const existing = userModerationState.get(userId) || { 
+    warningCount: 0, 
+    lastIncident: 0, 
+    timeoutUntil: 0,
+    pattern: 'first incident'
+  };
+  
+  // Reset warning count if it's been more than 7 days since last incident
+  const daysSinceLastIncident = (Date.now() - existing.lastIncident) / (1000 * 60 * 60 * 24);
+  if (daysSinceLastIncident > 7) {
+    existing.warningCount = 0;
+    existing.pattern = 'clean slate';
+  }
+  
+  return existing;
+}
+
+function updateModerationHistory(userId, toneIssues) {
+  const history = getUserModerationHistory(userId);
+  history.warningCount += 1;
+  history.lastIncident = Date.now();
+  
+  // Determine pattern based on recent behavior
+  if (history.warningCount === 1) {
+    history.pattern = 'first incident';
+  } else if (history.warningCount <= 3) {
+    history.pattern = 'repeat behavior';
+  } else {
+    history.pattern = 'chronic issue';
+  }
+  
+  // Escalating timeouts for repeat offenders
+  if (toneIssues.toxicity === 'high' || history.warningCount >= 4) {
+    const timeoutMinutes = Math.min(history.warningCount * 10, 60); // Max 1 hour
+    history.timeoutUntil = Date.now() + (timeoutMinutes * 60 * 1000);
+  }
+  
+  userModerationState.set(userId, history);
+  return history;
+}
+
+function isUserInTimeout(userId) {
+  const history = getUserModerationHistory(userId);
+  return Date.now() < history.timeoutUntil;
 }
 
 // ---------- moderation (existing) ----------
@@ -529,14 +621,46 @@ async function handleModeration(msg) {
     }
   }
   
-  const tone = await classifyBehavior(msg.content);
-  
+const tone = await classifyBehavior(msg.content);
+
+// Check if user is in timeout first
+if (isUserInTimeout(msg.author.id)) {
+  await msg.delete().catch(() => {});
+  return;
+}
+
+// Check if any tone issues detected
+const hasToneIssues = tone.passive_aggressive || tone.condescending || tone.provocation || tone.toxicity !== 'none';
+
+if (hasToneIssues) {
   const now = Date.now();
-  const last = lastToneReply.get(msg.author.id) || 0;
-  if ((tone.passive_aggressive || tone.condescending || tone.provocation) && (now - last >= TONE_COOLDOWN_MS)) {
-    await msg.reply(wittyCallout(tone));
+  const lastReply = lastToneReply.get(msg.author.id) || 0;
+  
+  // Cooldown to prevent spam, but shorter for repeat offenders
+  const userHistory = getUserModerationHistory(msg.author.id);
+  const cooldownMs = userHistory.warningCount > 2 ? 3000 : TONE_COOLDOWN_MS;
+  
+  if (now - lastReply >= cooldownMs) {
+    // Generate intelligent, context-aware response
+    const calloutResponse = await generateContextualCallout(msg.content, tone, userHistory);
+    await msg.reply(calloutResponse);
     lastToneReply.set(msg.author.id, now);
+    
+    // Update moderation history
+    const updatedHistory = updateModerationHistory(msg.author.id, tone);
+    
+    // Apply timeout if warranted
+    if (updatedHistory.timeoutUntil > Date.now()) {
+      const timeoutMinutes = Math.ceil((updatedHistory.timeoutUntil - Date.now()) / (1000 * 60));
+      try {
+        await msg.member.timeout(timeoutMinutes * 60 * 1000, 'Escalating behavioral issues');
+        await msg.reply(`🕐 Taking a ${timeoutMinutes}-minute break to cool down.`);
+      } catch (e) {
+        console.error('Failed to timeout user:', e);
+      }
+    }
   }
+}
   
   if (tone.toxicity === 'high' || (tone.toxicity === 'medium' && (tone.condescending || tone.provocation))) {
     await escalate(msg, `Hostile tone (${tone.toxicity})`);
@@ -745,6 +869,26 @@ client.on(Events.MessageCreate, async (msg) => {
         await msg.reply(`🌞 Un-shadowbanned ${target.username}.`);
       }
     }
+
+    // New: Moderation status check
+if (msg.content.startsWith('!modstatus')) {
+  const target = msg.mentions.users.first();
+  if (target) {
+    const history = getUserModerationHistory(target.id);
+    const isInTimeout = isUserInTimeout(target.id);
+    const timeoutRemaining = isInTimeout ? 
+      Math.ceil((history.timeoutUntil - Date.now()) / (1000 * 60)) : 0;
+    
+    await msg.reply(
+      `📊 Moderation status for <@${target.id}>:\n` +
+      `• Warning count: ${history.warningCount}\n` +
+      `• Pattern: ${history.pattern}\n` +
+      `• In timeout: ${isInTimeout ? `Yes (${timeoutRemaining}m remaining)` : 'No'}\n` +
+      `• Last incident: ${history.lastIncident ? new Date(history.lastIncident).toLocaleDateString() : 'Never'}`
+    );
+  }
+}
+
     
     // New: User profile inspection
     if (msg.content.startsWith('!profile')) {
