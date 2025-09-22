@@ -742,3 +742,139 @@ client.on(Events.MessageCreate, async (msg) => {
       const target = msg.mentions.users.first();
       if (target) {
         shadowBanned.delete(target.id);
+        await msg.reply(`🌞 Un-shadowbanned ${target.username}.`);
+      }
+    }
+    
+    // New: User profile inspection
+    if (msg.content.startsWith('!profile')) {
+      const target = msg.mentions.users.first();
+      if (target) {
+        const profile = await getUserProfile(target.id);
+        if (profile) {
+          await msg.reply(
+            `👤 Profile for <@${target.id}>:\n` +
+            `• Age range: ${profile.age_range || 'unknown'}\n` +
+            `• Gender likely: ${profile.gender_likely || 'unknown'}\n` +
+            `• Flirty level: ${Math.round((profile.flirty_level || 0) * 10)}/10\n` +
+            `• Interests: ${(profile.interests || []).slice(0, 5).join(', ') || 'none detected'}\n` +
+            `• Traits: ${(profile.traits || []).slice(0, 5).join(', ') || 'none detected'}`
+          );
+        } else {
+          await msg.reply(`No profile data for <@${target.id}> yet.`);
+        }
+      }
+    }
+    
+    // New: Force conversation starter
+    if (msg.content === '!starter') {
+      const starter = await getTechTrends();
+      await msg.channel.send(starter);
+      
+      // Update database tracking
+      await updateChannelActivity(msg.channelId, msg.guildId);
+      await recordAutoStarter(msg.channelId);
+      
+      // Save to conversation history
+      await saveConversationMessage({
+        channelId: msg.channelId,
+        guildId: msg.guildId,
+        userId: null,
+        role: 'assistant',
+        content: starter
+      });
+      
+      await msg.reply('🚀 Conversation starter deployed!');
+    }
+    
+    // New: Run database cleanup
+    if (msg.content === '!cleanup') {
+      await runDailyCleanup();
+      await msg.reply('🧹 Database cleanup completed!');
+    }
+    
+    // Existing SUS commands...
+    if (msg.content.startsWith('!sus ')) {
+      const m = msg.content.split(/\s+/);
+      const target = msg.mentions.users.first();
+      const hours = Number(m[m.length - 1]) || 24;
+      if (!target) return msg.reply('Usage: `!sus @user [hours]`');
+      const s = await getUserBehaviorSummary({ userId: target.id, hours });
+      await msg.reply(
+        `🕵️ Report for <@${target.id}> (last ${hours}h):\n` +
+        `• incidents: ${s.total || 0}\n` +
+        `• passive-aggr: ${s.passive_aggr || 0}\n` +
+        `• condescending: ${s.condescending || 0}\n` +
+        `• provocation: ${s.provocation || 0}\n` +
+        `• actions taken: ${s.actions || 0}`
+      );
+      return;
+    }
+    
+    if (msg.content.startsWith('!susrecent')) {
+      const parts = msg.content.split(/\s+/);
+      const hours = Number(parts[1]) || 24;
+      const limit = Number(parts[2]) || 10;
+      const rows = await getRecentIncidents({ guildId: msg.guildId, hours, limit });
+      if (!rows.length) return msg.reply(`No incidents in last ${hours}h.`);
+      const lines = rows.map(r =>
+        `• <@${r.user_id}> ${r.action_taken || 'none'} ` +
+        `${r.passive_aggr ? 'PA ' : ''}${r.condescending ? 'COND ' : ''}${r.provocation ? 'PROV ' : ''}`.trim()
+      );
+      await msg.reply(`🧾 Recent incidents (last ${hours}h):\n${lines.join('\n')}`);
+      return;
+    }
+    
+    if (msg.content.startsWith('!suswho')) {
+      const parts = msg.content.split(/\s+/);
+      const hours = Number(parts[1]) || 24;
+      const limit = Number(parts[2]) || 5;
+      const rows = await getTopSuspects({ guildId: msg.guildId, hours, limit });
+      if (!rows.length) return msg.reply(`Clean slate in last ${hours}h.`);
+      const lines = rows.map((r, i) =>
+        `${i+1}. <@${r.user_id}> — actions: ${r.actions}, tone flags: ${r.tone_flags}, incidents: ${r.incidents}`
+      );
+      await msg.reply(`🏴 Top suspects (last ${hours}h):\n${lines.join('\n')}`);
+      return;
+    }
+  }
+  
+  await handleModeration(msg);
+  await handleConversation(msg);
+  await handleAutoThreads(msg);
+});
+
+// ---------- startup & auto-starter loop ----------
+client.once(Events.ClientReady, () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  
+  // Set up auto-starter interval (check every 30 minutes)
+  setInterval(checkAndSendAutoStarter, 30 * 60 * 1000);
+  
+  // Set up daily cleanup (run at 3 AM)
+  const scheduleCleanup = () => {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(3, 0, 0, 0); // 3 AM
+    
+    const msUntilCleanup = tomorrow.getTime() - now.getTime();
+    setTimeout(() => {
+      runDailyCleanup();
+      setInterval(runDailyCleanup, 24 * 60 * 60 * 1000); // Then every 24 hours
+    }, msUntilCleanup);
+  };
+  scheduleCleanup();
+  
+  // Initialize activity tracking for existing channels
+  client.guilds.cache.forEach(guild => {
+    guild.channels.cache
+      .filter(channel => channel.type === 0) // Text channels only
+      .forEach(async channel => {
+        await updateChannelActivity(channel.id, guild.id);
+      });
+  });
+});
+
+client.login(process.env.DISCORD_TOKEN);
+
