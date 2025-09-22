@@ -631,7 +631,7 @@ async function handleConversation(msg) {
   
   if (/stop yapping|no\b/i.test(msg.content.toLowerCase())) {
     activeConvos.set(channelId, 'off');
-    reply = '🤐 Okay, I\'ll stay out.';
+    reply = "🤐 Okay, I'll stay out."; // changed it to ""
     await msg.reply(reply);
   }
   
