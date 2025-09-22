@@ -637,7 +637,7 @@ async function handleConversation(msg) {
   
   if (/yes|be part/i.test(msg.content.toLowerCase())) {
     activeConvos.set(channelId, 'on');
-    reply = '😎 Cool, I'm in.';
+    reply = "😎 Cool, I'm in.";// changed it to ""
     await msg.reply(reply);
   }
   
