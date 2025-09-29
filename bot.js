@@ -56,6 +56,8 @@ const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
 const MAX_CONVERSATION_LENGTH = 20; // keep last 20 messages for context
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const AUTO_STARTER_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
+const STARTER_MODEL = process.env.STARTER_MODEL || 'gpt-4o-mini'; // safe default
+
 
 // ---------- per-channel config (themes, prompts, cooldowns, attribution) ----------
 const CHANNEL_CONFIG = {
@@ -288,17 +290,14 @@ async function getStarterForChannel(channelId) {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  // up to 2 tries: if model returns a year/prediction, we regenerate
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-5",
-        temperature: 0.7,
-        messages: [
-          {
-            role: "system",
-            content:
-`${config.prompt}
+  // helper: one attempt, optionally with temperature
+  const tryOnce = async ({ withTemp }) => {
+    const payload = {
+      model: STARTER_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: `${config.prompt}
 
 HARD RULES (must follow):
 - Today is ${today}.
@@ -307,10 +306,28 @@ HARD RULES (must follow):
 - One line, under ${config.maxLen || 200} characters.
 - End with a question.
 - No code fences, no hashtags, no quotes.`
-          },
-          { role: "user", content: "Give one fresh conversation starter for this channel." }
-        ]
-      });
+        },
+        { role: "user", content: "Give one fresh conversation starter for this channel." }
+      ]
+    };
+    if (withTemp) payload.temperature = 0.7; // many models allow this, some don't
+
+    return await openai.chat.completions.create(payload);
+  };
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // attempt 1: with temperature; if it fails for unsupported_value, retry w/o
+      let resp;
+      try {
+        resp = await tryOnce({ withTemp: true });
+      } catch (e) {
+        if (e?.code === 'unsupported_value' && e?.param === 'temperature') {
+          resp = await tryOnce({ withTemp: false });
+        } else {
+          throw e;
+        }
+      }
 
       const raw = resp.choices?.[0]?.message?.content || '';
       const clean = sanitizeStarter(raw, {
@@ -318,16 +335,20 @@ HARD RULES (must follow):
         maxLen: config.maxLen || 200,
         forbidYears: true
       });
-
-      if (clean) return clean; // passes all guards -> done
+      if (clean) return clean;
     } catch (e) {
-      console.error(`Starter generation error (attempt ${attempt+1}) for ${channelId}:`, e);
+      console.error(`Starter generation error (attempt ${attempt + 1}) for ${channelId}:`, e);
+
+      // hard fallback to a known-good model if the chosen one keeps failing
+      if (attempt === 0) {
+        process.env.STARTER_MODEL = 'gpt-4o-mini';
+      }
     }
   }
 
-  // safe fallback (no dates, ends with a question)
   return "Let’s kick this off, what’s everyone building right now?";
 }
+
 
 
 // ---------- auto-starter with per-channel cooldown ----------
