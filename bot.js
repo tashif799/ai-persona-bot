@@ -57,6 +57,70 @@ const MAX_CONVERSATION_LENGTH = 20; // keep last 20 messages for context
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const AUTO_STARTER_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
 
+// ---------- per-channel config (themes, prompts, cooldowns, attribution) ----------
+const CHANNEL_CONFIG = {
+  "1384689466941116652": { // GENERAL CHAT
+    theme: "general fun chat",
+    prompt: `You are writing for GENERAL CHAT.
+Goal: spark casual, funny, everyday banter.
+Style: witty, warm, like a friend in the group.
+Rules:
+- Use current pop culture / social media / gaming memes from right now.
+- Must feel human, not robotic.
+- End with a playful open question.
+- Keep under 200 characters.
+- Do NOT add sources here — it should feel natural.`,
+    cooldownHours: 12,
+    attribution: null
+  },
+
+  "1405402423320772618": { // GADGETS
+    theme: "gadgets and tech news",
+    prompt: `You are writing for GADGETS.
+Goal: get people talking about latest gadgets, phones, and AI products.
+Style: geeky but approachable, like a curious techie.
+Rules:
+- Pull in today's *latest* tech news (phones, AI, VR, etc.).
+- Mention product names or features people recognize.
+- Avoid predictions beyond this year — keep it "now".
+- End with "What do you think?" or similar.
+- Attribution format: [via TechCrunch], [via The Verge], [via Wired].`,
+    cooldownHours: 24,
+    attribution: "[via Tech site]"
+  },
+
+  "1384748551740985384": { // RANDOM
+    theme: "random silly banter",
+    prompt: `You are writing for RANDOM.
+Goal: post something chaotic, absurd, or funny that sparks random chatter.
+Style: unhinged internet humor (but safe).
+Rules:
+- Can be a weird question, dumb observation, or surreal meme reference.
+- May use emojis and slang.
+- Absolutely no news or serious tone.
+- Attribution format: [spotted on Twitter], [from Reddit], [seen on TikTok].
+- Keep under 200 characters.`,
+    cooldownHours: 24,
+    attribution: "[spotted online]"
+  },
+
+  "1384748621089476719": { // NEW TO PROGRAMMING
+    theme: "beginner programming tips and encouragement",
+    prompt: `You are writing for NEW TO PROGRAMMING.
+Goal: encourage beginners and spark coding talk.
+Style: kind, funny, and slightly nerdy mentor vibe.
+Rules:
+- Use fresh references to today's beginner coding struggles (like current frameworks, IDEs, AI coding tools).
+- No jargon overload — keep it welcoming.
+- End with a supportive question ("what tripped you up today?" etc.).
+- Attribution format: [from GitHub Blog], [via StackOverflow], [via dev.to].`,
+    cooldownHours: 24,
+    attribution: "[via dev blog]"
+  }
+};
+
+
+
 // ---------- moderation state (existing) ----------
 const strikes = new Map();
 const STRIKE_LIMITS = { warn: 1, timeout: 2, kick: 3, ban: 4 };
@@ -184,99 +248,91 @@ async function getPersonalityModifier(userId) {
 }
 
 // ---------- tech news & conversation starters with database ----------
-async function getTechTrends() {
+// ---------- per-channel starter generator ----------
+async function getStarterForChannel(channelId) {
+  const config = CHANNEL_CONFIG[channelId];
+  if (!config) return null;
+
   try {
-    // Try to get a stored starter from database first
-    const storedStarter = await getRandomStarter('tech', 3);
-    
-    if (storedStarter && Math.random() > 0.3) { // 70% chance to use stored starter
-      await recordStarterUsage(storedStarter.id);
-      return storedStarter.content;
-    }
-    
-    // Generate new starter
     const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: "gpt-5",
       messages: [
         {
-          role: 'system',
-          content: `Generate a witty, informative conversation starter about current tech industry trends. Make it:
-- Clever and engaging, not basic
-- Include a surprising fact or insight
-- Relate to developer/tech community interests
-- Add a touch of humor or irony
-- End with a question to spark discussion
-Keep it under 280 characters and naturally conversational.`
+          role: "system",
+          content: `${config.prompt}
+IMPORTANT:
+- Be aware of *current events and industry news*. 
+- If a source is referenced, use the attribution style defined in the rules above.`
         },
+        { role: "user", content: "Generate one fresh conversation starter for this channel." }
+      ],
+      tools: [
         {
-          role: 'user',
-          content: 'Create a tech conversation starter for a Discord server'
+          type: "web_search",
+          description: "Use search to grab fresh, trending context if needed."
         }
       ]
     });
-    
-    const newStarter = resp.choices[0].message.content.trim();
-    
-    // Save new starter to database for future use
-    await saveConversationStarter({ 
-      content: newStarter, 
-      category: 'tech', 
-      rating: 4 
-    });
-    
-    return newStarter;
+
+    let text = resp.choices[0].message.content.trim();
+
+    // Append fallback attribution if required but missing
+    if (config.attribution && !/\[.*\]/.test(text)) {
+      text += ` ${config.attribution}`;
+    }
+
+    return text;
   } catch (e) {
-    console.error('Tech trends generation failed:', e);
-    return "Anyone else notice how we went from 'don't trust anything on the internet' to 'hey Google, order my groceries'? Wild how fast we pivoted. What tech shift caught you most off guard?";
+    console.error(`Starter generation failed for channel ${channelId}:`, e);
+    return "👀 Anyone lurking here?";
   }
 }
 
+// ---------- auto-starter with per-channel cooldown ----------
 async function checkAndSendAutoStarter() {
   try {
-    const inactiveChannels = await getInactiveChannels(12); // 12 hours
-    
-    for (const channelData of inactiveChannels) {
+    for (const [channelId, config] of Object.entries(CHANNEL_CONFIG)) {
+      const inactiveChannels = await getInactiveChannels(config.cooldownHours);
+
+      if (!inactiveChannels.find(c => c.channel_id === channelId)) continue;
+
       try {
-        const channel = await client.channels.fetch(channelData.channel_id);
-        if (!channel || channel.type !== 0) continue; // Only text channels
-        
-        // Check conversation history to avoid spamming if bot was last to speak
-        const recentHistory = await getConversationHistory({ 
-          channelId: channel.id, 
-          limit: 1, 
-          maxAgeHours: 1 
+        const channel = await client.channels.fetch(channelId);
+        if (!channel || channel.type !== 0) continue;
+
+        // Avoid spamming if bot was last to speak
+        const recentHistory = await getConversationHistory({
+          channelId,
+          limit: 1,
+          maxAgeHours: 1
         });
-        
-        if (recentHistory.length > 0 && recentHistory[recentHistory.length - 1].role === 'assistant') {
-          continue; // Skip if bot was last to speak
-        }
-        
-        const starter = await getTechTrends();
+        if (recentHistory.length > 0 && recentHistory[0].role === "assistant") continue;
+
+        const starter = await getStarterForChannel(channelId);
+        if (!starter) continue;
+
         await channel.send(starter);
-        
-        // Update database tracking
+
         await updateChannelActivity(channel.id, channel.guildId);
         await recordAutoStarter(channel.id);
-        
-        // Save to conversation history
         await saveConversationMessage({
           channelId: channel.id,
           guildId: channel.guildId,
-          userId: null, // Bot message
-          role: 'assistant',
+          userId: null,
+          role: "assistant",
           content: starter
         });
-        
-        console.log(`Sent auto-starter to ${channel.name}: ${starter}`);
-        
+
+        console.log(`✅ Starter sent to ${channel.name} (${config.theme}): ${starter}`);
       } catch (e) {
-        console.error(`Failed to send auto-starter to channel ${channelData.channel_id}:`, e);
+        console.error(`Failed to send starter to channel ${channelId}:`, e);
       }
     }
   } catch (error) {
-    console.error('Auto-starter check failed:', error);
+    console.error("Auto-starter check failed:", error);
   }
 }
+
 
 // ---------- existing helpers (updated for conversation) ----------
 function decayStrikes(userId) {
@@ -911,25 +967,31 @@ if (msg.content.startsWith('!modstatus')) {
     }
     
     // New: Force conversation starter
-    if (msg.content === '!starter') {
-      const starter = await getTechTrends();
-      await msg.channel.send(starter);
-      
-      // Update database tracking
-      await updateChannelActivity(msg.channelId, msg.guildId);
-      await recordAutoStarter(msg.channelId);
-      
-      // Save to conversation history
-      await saveConversationMessage({
-        channelId: msg.channelId,
-        guildId: msg.guildId,
-        userId: null,
-        role: 'assistant',
-        content: starter
-      });
-      
-      await msg.reply('🚀 Conversation starter deployed!');
-    }
+   if (msg.content === '!starter') {
+  const config = CHANNEL_CONFIG[msg.channelId];
+  if (!config) return msg.reply("⚠️ This channel doesn't support starters.");
+
+  const starter = await getStarterForChannel(msg.channelId);
+  if (!starter) return;
+
+  await msg.channel.send(starter);
+
+  // Update database tracking
+  await updateChannelActivity(msg.channelId, msg.guildId);
+  await recordAutoStarter(msg.channelId);
+
+  // Save to conversation history
+  await saveConversationMessage({
+    channelId: msg.channelId,
+    guildId: msg.guildId,
+    userId: null,
+    role: 'assistant',
+    content: starter
+  });
+
+  await msg.reply('🚀 Conversation starter deployed!');
+}
+
     
     // New: Run database cleanup
     if (msg.content === '!cleanup') {
