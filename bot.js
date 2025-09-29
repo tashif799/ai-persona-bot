@@ -247,46 +247,88 @@ async function getPersonalityModifier(userId) {
   }
 }
 
+  // ---------- starter sanitizer (blocks years, enforces style) ----------
+function sanitizeStarter(text, { attribution=null, maxLen=200, forbidYears=true }) {
+  if (!text) return null;
+  let s = String(text).trim();
+
+  // remove surrounding quotes/backticks if present
+  s = s.replace(/^["'`]|["'`]$/g, '');
+
+  // block explicit years & "by/in YEAR" predictions
+  if (forbidYears) {
+    if (/\b20\d{2}\b/.test(s) || /\b(?:by|in)\s+20\d{2}\b/i.test(s)) return null;
+    if (/\b(?:next\s+year|by\s+year(?:'s)?\s+end)\b/i.test(s)) return null;
+  }
+
+  // make sure it ends with a question (engagement)
+  if (!/[?？]$/.test(s)) s += ' — what do you think?';
+
+  // enforce max length
+  if (s.length > maxLen) s = s.slice(0, maxLen - 1) + '…';
+
+  // attribution rules
+  if (!attribution) {
+    // strip any bracketed source if model added one
+    s = s.replace(/\s*\[[^\]]+\]\s*$/,'');
+  } else {
+    // append a fallback source if none was added
+    if (!/\[[^\]]+\]\s*$/.test(s)) s += ` ${attribution}`;
+  }
+
+  return s;
+}
+
 // ---------- tech news & conversation starters with database ----------
+// ---------- per-channel starter generator ----------
 // ---------- per-channel starter generator ----------
 async function getStarterForChannel(channelId) {
   const config = CHANNEL_CONFIG[channelId];
   if (!config) return null;
 
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-5",
-      messages: [
-        {
-          role: "system",
-          content: `${config.prompt}
-IMPORTANT:
-- Be aware of *current events and industry news*. 
-- If a source is referenced, use the attribution style defined in the rules above.`
-        },
-        { role: "user", content: "Generate one fresh conversation starter for this channel." }
-      ],
-      tools: [
-        {
-          type: "web_search",
-          description: "Use search to grab fresh, trending context if needed."
-        }
-      ]
-    });
+  const today = new Date().toISOString().slice(0, 10);
 
-    let text = resp.choices[0].message.content.trim();
+  // up to 2 tries: if model returns a year/prediction, we regenerate
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-5",
+        temperature: 0.7,
+        messages: [
+          {
+            role: "system",
+            content:
+`${config.prompt}
 
-    // Append fallback attribution if required but missing
-    if (config.attribution && !/\[.*\]/.test(text)) {
-      text += ` ${config.attribution}`;
+HARD RULES (must follow):
+- Today is ${today}.
+- Do NOT use explicit years (e.g., 2023/2024/2025) or phrases like "by 2025", "in 2024", "next year".
+- Refer to time as "today", "this week", "right now" only.
+- One line, under ${config.maxLen || 200} characters.
+- End with a question.
+- No code fences, no hashtags, no quotes.`
+          },
+          { role: "user", content: "Give one fresh conversation starter for this channel." }
+        ]
+      });
+
+      const raw = resp.choices?.[0]?.message?.content || '';
+      const clean = sanitizeStarter(raw, {
+        attribution: config.attribution,
+        maxLen: config.maxLen || 200,
+        forbidYears: true
+      });
+
+      if (clean) return clean; // passes all guards -> done
+    } catch (e) {
+      console.error(`Starter generation error (attempt ${attempt+1}) for ${channelId}:`, e);
     }
-
-    return text;
-  } catch (e) {
-    console.error(`Starter generation failed for channel ${channelId}:`, e);
-    return "👀 Anyone lurking here?";
   }
+
+  // safe fallback (no dates, ends with a question)
+  return "Let’s kick this off, what’s everyone building right now?";
 }
+
 
 // ---------- auto-starter with per-channel cooldown ----------
 async function checkAndSendAutoStarter() {
@@ -308,6 +350,8 @@ async function checkAndSendAutoStarter() {
         });
         if (recentHistory.length > 0 && recentHistory[0].role === "assistant") continue;
 
+
+        
         const starter = await getStarterForChannel(channelId);
         if (!starter) continue;
 
