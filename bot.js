@@ -1,3 +1,5 @@
+// bot.js — moderation-only + robust profiling (no auto-starters, no chat-joins)
+
 import 'dotenv/config';
 import {
   Client,
@@ -7,33 +9,21 @@ import {
   PermissionsBitField,
 } from 'discord.js';
 import OpenAI from 'openai';
-import fs from 'node:fs/promises';
-import { embed } from './embed.js';
+
+// --- db funcs used for moderation + profiling + reports ---
 import {
-  rememberEmbedding,
-  searchSimilar,
-  rememberUserQuirk,
-  getUserQuirks,
   logModerationEvent,
   getRecentIncidents,
   getUserBehaviorSummary,
   getTopSuspects,
-  // New database functions
-  saveConversationMessage,
-  getConversationHistory,
+  runDailyCleanup,
+  // profiling storage
   updateUserProfile,
   getUserProfile,
-  updateChannelActivity,
-  getInactiveChannels,
-  recordAutoStarter,
-  saveConversationStarter,
-  getRandomStarter,
-  recordStarterUsage,
-  runDailyCleanup
+  rememberUserQuirk,
+  // optional: message log (kept ON for profiling context/history if you want)
+  saveConversationMessage,
 } from './db.js';
-
-// ---------- load persona ----------
-let persona = JSON.parse(await fs.readFile('./persona/kmwyl.json', 'utf8'));
 
 // ---------- setup ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -49,81 +39,9 @@ const client = new Client({
 });
 
 const OWNER_ID = process.env.OWNER_ID?.trim();
-const PERSONA_ID = 'kmwyl';
 const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
 
-// ---------- conversation & auto-starter constants ----------
-const MAX_CONVERSATION_LENGTH = 20; // keep last 20 messages for context
-const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-const AUTO_STARTER_COOLDOWN_MS = 12 * 60 * 60 * 1000; // 12 hours
-const STARTER_MODEL = process.env.STARTER_MODEL || 'gpt-4o-mini'; // safe default
-
-
-// ---------- per-channel config (themes, prompts, cooldowns, attribution) ----------
-const CHANNEL_CONFIG = {
-  "1384689466941116652": { // GENERAL CHAT
-    theme: "general fun chat",
-    prompt: `You are writing for GENERAL CHAT.
-Goal: spark casual, funny, everyday banter.
-Style: witty, warm, like a friend in the group.
-Rules:
-- Use current pop culture / social media / gaming memes from right now.
-- Must feel human, not robotic.
-- End with a playful open question.
-- Keep under 200 characters.
-- Do NOT add sources here — it should feel natural.`,
-    cooldownHours: 12,
-    attribution: null
-  },
-
-  "1405402423320772618": { // GADGETS
-    theme: "gadgets and tech news",
-    prompt: `You are writing for GADGETS.
-Goal: get people talking about latest gadgets, phones, and AI products.
-Style: geeky but approachable, like a curious techie.
-Rules:
-- Pull in today's *latest* tech news (phones, AI, VR, etc.).
-- Mention product names or features people recognize.
-- Avoid predictions beyond this year — keep it "now".
-- End with "What do you think?" or similar.
-- Attribution format: [via TechCrunch], [via The Verge], [via Wired].`,
-    cooldownHours: 24,
-    attribution: "[via Tech site]"
-  },
-
-  "1384748551740985384": { // RANDOM
-    theme: "random silly banter",
-    prompt: `You are writing for RANDOM.
-Goal: post something chaotic, absurd, or funny that sparks random chatter.
-Style: unhinged internet humor (but safe).
-Rules:
-- Can be a weird question, dumb observation, or surreal meme reference.
-- May use emojis and slang.
-- Absolutely no news or serious tone.
-- Attribution format: [spotted on Twitter], [from Reddit], [seen on TikTok].
-- Keep under 200 characters.`,
-    cooldownHours: 24,
-    attribution: "[spotted online]"
-  },
-
-  "1384748621089476719": { // NEW TO PROGRAMMING
-    theme: "beginner programming tips and encouragement",
-    prompt: `You are writing for NEW TO PROGRAMMING.
-Goal: encourage beginners and spark coding talk.
-Style: kind, funny, and slightly nerdy mentor vibe.
-Rules:
-- Use fresh references to today's beginner coding struggles (like current frameworks, IDEs, AI coding tools).
-- No jargon overload — keep it welcoming.
-- End with a supportive question ("what tripped you up today?" etc.).
-- Attribution format: [from GitHub Blog], [via StackOverflow], [via dev.to].`,
-    cooldownHours: 24,
-    attribution: "[via dev blog]"
-  }
-};
-
-
-
-// ---------- moderation state (existing) ----------
+// ---------- moderation state ----------
 const strikes = new Map();
 const STRIKE_LIMITS = { warn: 1, timeout: 2, kick: 3, ban: 4 };
 const STRIKE_DECAY_MS = 1000 * 60 * 60 * 24 * 7;
@@ -131,275 +49,13 @@ const DISABLED_GUILDS = new Set();
 const shadowBanned = new Set();
 const messageHistory = new Map();
 const recentJoins = [];
-const activeConvos = new Map();
 const lastToneReply = new Map();
 const TONE_COOLDOWN_MS = 5000;
-// Enhanced moderation state
-const userModerationState = new Map(); // userId -> { warningCount, lastIncident, timeoutUntil }
 
+// escalating timeouts
+const userModerationState = new Map(); // userId -> { warningCount, lastIncident, timeoutUntil, pattern }
 
-// ---------- enhanced conversation memory with database ----------
-async function getConversationContext(channelId) {
-  try {
-    const history = await getConversationHistory({ 
-      channelId, 
-      limit: MAX_CONVERSATION_LENGTH, 
-      maxAgeHours: CONVERSATION_TIMEOUT_MS / (1000 * 60 * 60) 
-    });
-    
-    // Convert to OpenAI format
-    return history.map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }));
-  } catch (error) {
-    console.error('Failed to get conversation context:', error);
-    return [];
-  }
-}
-
-// ---------- user profiling & flirty behavior with database ----------
-async function analyzeUserProfile(message, userId) {
-  try {
-    const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `Analyze this message to infer user demographics and personality. Output JSON with:
-- age_range: "under_18"|"18_25"|"26_35"|"35_plus"|"unknown"
-- gender_likely: "male"|"female"|"non_binary"|"unknown"
-- interests: array of interests mentioned/implied
-- personality_traits: array of traits (witty, nerdy, casual, etc)
-- flirty_appropriate: boolean (only true if clearly 18+ AND shows interest in flirty banter)
-Base this on writing style, topics, slang, references, etc. Be conservative with age/gender assumptions.`
-        },
-        { role: 'user', content: message }
-      ]
-    });
-    
-    const analysis = JSON.parse(resp.choices[0].message.content);
-    
-    // Get existing profile from database
-    const existingProfile = await getUserProfile(userId) || { 
-      interests: [], 
-      traits: [], 
-      flirty_level: 0 
-    };
-    
-    // Merge new analysis with existing data
-    const updatedInterests = [...new Set([...existingProfile.interests, ...analysis.interests])];
-    const updatedTraits = [...new Set([...existingProfile.traits, ...analysis.personality_traits])];
-    
-    // Adjust flirty level based on appropriateness
-    let newFlirtyLevel = existingProfile.flirty_level;
-    if (analysis.flirty_appropriate && (analysis.age_range === '18_25' || analysis.age_range === '26_35' || analysis.age_range === '35_plus')) {
-      newFlirtyLevel = Math.min(newFlirtyLevel + 0.1, 1.0);
-    }
-    
-    // Update profile in database
-    await updateUserProfile({
-      userId,
-      ageRange: analysis.age_range,
-      genderLikely: analysis.gender_likely,
-      interests: updatedInterests,
-      traits: updatedTraits,
-      flirtyLevel: newFlirtyLevel
-    });
-    
-    // Remember interesting traits in user memory
-    if (analysis.personality_traits.length > 0) {
-      await rememberUserQuirk(userId, `Traits: ${analysis.personality_traits.join(', ')}`);
-    }
-    
-  } catch (e) {
-    console.error('User profile analysis failed:', e);
-  }
-}
-
-async function getPersonalityModifier(userId) {
-  try {
-    const profile = await getUserProfile(userId);
-    if (!profile) return '';
-    
-    let modifier = '';
-    
-    // Add flirty behavior for appropriate users
-    if (profile.flirty_level > 0.3 && profile.age_range !== 'under_18' && profile.age_range !== 'unknown') {
-      const flirtyLevel = Math.min(profile.flirty_level, 0.8); // Cap it
-      modifier += `Be subtly flirty and charming (level: ${Math.round(flirtyLevel * 10)}/10). `;
-    }
-    
-    // Adapt to interests
-    if (profile.interests && profile.interests.length > 0) {
-      modifier += `User interests: ${profile.interests.slice(0, 3).join(', ')}. `;
-    }
-    
-    // Adapt to personality
-    if (profile.traits && profile.traits.length > 0) {
-      modifier += `User traits: ${profile.traits.slice(0, 3).join(', ')}. `;
-    }
-    
-    return modifier;
-  } catch (error) {
-    console.error('Failed to get personality modifier:', error);
-    return '';
-  }
-}
-
-  // ---------- starter sanitizer (blocks years, enforces style) ----------
-function sanitizeStarter(text, { attribution=null, maxLen=200, forbidYears=true }) {
-  if (!text) return null;
-  let s = String(text).trim();
-
-  // remove surrounding quotes/backticks if present
-  s = s.replace(/^["'`]|["'`]$/g, '');
-
-  // block explicit years & "by/in YEAR" predictions
-  if (forbidYears) {
-    if (/\b20\d{2}\b/.test(s) || /\b(?:by|in)\s+20\d{2}\b/i.test(s)) return null;
-    if (/\b(?:next\s+year|by\s+year(?:'s)?\s+end)\b/i.test(s)) return null;
-  }
-
-  // make sure it ends with a question (engagement)
-  if (!/[?？]$/.test(s)) s += ' — what do you think?';
-
-  // enforce max length
-  if (s.length > maxLen) s = s.slice(0, maxLen - 1) + '…';
-
-  // attribution rules
-  if (!attribution) {
-    // strip any bracketed source if model added one
-    s = s.replace(/\s*\[[^\]]+\]\s*$/,'');
-  } else {
-    // append a fallback source if none was added
-    if (!/\[[^\]]+\]\s*$/.test(s)) s += ` ${attribution}`;
-  }
-
-  return s;
-}
-
-// ---------- tech news & conversation starters with database ----------
-// ---------- per-channel starter generator ----------
-// ---------- per-channel starter generator ----------
-async function getStarterForChannel(channelId) {
-  const config = CHANNEL_CONFIG[channelId];
-  if (!config) return null;
-
-  const today = new Date().toISOString().slice(0, 10);
-
-  // helper: one attempt, optionally with temperature
-  const tryOnce = async ({ withTemp }) => {
-    const payload = {
-      model: STARTER_MODEL,
-      messages: [
-        {
-          role: "system",
-          content: `${config.prompt}
-
-HARD RULES (must follow):
-- Today is ${today}.
-- Do NOT use explicit years (e.g., 2023/2024/2025) or phrases like "by 2025", "in 2024", "next year".
-- Refer to time as "today", "this week", "right now" only.
-- One line, under ${config.maxLen || 200} characters.
-- End with a question.
-- No code fences, no hashtags, no quotes.`
-        },
-        { role: "user", content: "Give one fresh conversation starter for this channel." }
-      ]
-    };
-    if (withTemp) payload.temperature = 0.7; // many models allow this, some don't
-
-    return await openai.chat.completions.create(payload);
-  };
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      // attempt 1: with temperature; if it fails for unsupported_value, retry w/o
-      let resp;
-      try {
-        resp = await tryOnce({ withTemp: true });
-      } catch (e) {
-        if (e?.code === 'unsupported_value' && e?.param === 'temperature') {
-          resp = await tryOnce({ withTemp: false });
-        } else {
-          throw e;
-        }
-      }
-
-      const raw = resp.choices?.[0]?.message?.content || '';
-      const clean = sanitizeStarter(raw, {
-        attribution: config.attribution,
-        maxLen: config.maxLen || 200,
-        forbidYears: true
-      });
-      if (clean) return clean;
-    } catch (e) {
-      console.error(`Starter generation error (attempt ${attempt + 1}) for ${channelId}:`, e);
-
-      // hard fallback to a known-good model if the chosen one keeps failing
-      if (attempt === 0) {
-        process.env.STARTER_MODEL = 'gpt-4o-mini';
-      }
-    }
-  }
-
-  return "Let’s kick this off, what’s everyone building right now?";
-}
-
-
-
-// ---------- auto-starter with per-channel cooldown ----------
-async function checkAndSendAutoStarter() {
-  try {
-    for (const [channelId, config] of Object.entries(CHANNEL_CONFIG)) {
-      const inactiveChannels = await getInactiveChannels(config.cooldownHours);
-
-      if (!inactiveChannels.find(c => c.channel_id === channelId)) continue;
-
-      try {
-        const channel = await client.channels.fetch(channelId);
-        if (!channel || channel.type !== 0) continue;
-
-        // Avoid spamming if bot was last to speak
-        const recentHistory = await getConversationHistory({
-          channelId,
-          limit: 1,
-          maxAgeHours: 1
-        });
-        if (recentHistory.length > 0 && recentHistory[0].role === "assistant") continue;
-
-
-        
-        const starter = await getStarterForChannel(channelId);
-        if (!starter) continue;
-
-        await channel.send(starter);
-
-        await updateChannelActivity(channel.id, channel.guildId);
-        await recordAutoStarter(channel.id);
-        await saveConversationMessage({
-          channelId: channel.id,
-          guildId: channel.guildId,
-          userId: null,
-          role: "assistant",
-          content: starter
-        });
-
-        console.log(`✅ Starter sent to ${channel.name} (${config.theme}): ${starter}`);
-      } catch (e) {
-        console.error(`Failed to send starter to channel ${channelId}:`, e);
-      }
-    }
-  } catch (error) {
-    console.error("Auto-starter check failed:", error);
-  }
-}
-
-
-// ---------- existing helpers (updated for conversation) ----------
+// ---------- helpers ----------
 function decayStrikes(userId) {
   const entry = strikes.get(userId);
   if (!entry) return 0;
@@ -457,7 +113,7 @@ async function escalate(msg, reason) {
   const prev = decayStrikes(id);
   const count = prev + 1;
   strikes.set(id, { count, lastStrike: Date.now() });
-  
+
   let action = 'none';
   if (count === STRIKE_LIMITS.warn) {
     action = 'warn';
@@ -479,12 +135,11 @@ async function escalate(msg, reason) {
     await msg.channel.send(`${msg.author.tag} was banned.`);
     await logEvidence(msg.guild, msg, reason, 'Ban');
   }
-  
+
   await recordLog(msg, { action });
   return action;
 }
 
-// ---------- copypasta + emoji helpers (existing) ----------
 function normalizeForRepeat(s) {
   return (s || '')
     .toLowerCase()
@@ -496,7 +151,7 @@ function normalizeForRepeat(s) {
 function hasCopypastaInSingleMessage(text) {
   if (!text) return false;
   if (text.replace(/\s+/g, ' ').trim().length < 30) return false;
-  
+
   const rawLines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
   if (rawLines.length >= 3) {
     const lineCounts = new Map();
@@ -507,7 +162,7 @@ function hasCopypastaInSingleMessage(text) {
     }
     if ([...lineCounts.values()].some(c => c >= 3)) return true;
   }
-  
+
   const sentences = normalizeForRepeat(text).split(/(?<=[.!?])\s+/).filter(Boolean);
   if (sentences.length >= 3) {
     const sentCounts = new Map();
@@ -517,7 +172,7 @@ function hasCopypastaInSingleMessage(text) {
     }
     if ([...sentCounts.values()].some(c => c >= 3)) return true;
   }
-  
+
   const t = normalizeForRepeat(text);
   if (t.length >= 120) {
     const window = 60;
@@ -556,7 +211,7 @@ async function deleteRecentDuplicates(msg, normalizedTarget, scanLimit = 50, max
   }
 }
 
-// ---------- LLM tone classifier (existing) ----------
+// ---------- tone classifier & callout ----------
 async function classifyBehavior(text) {
   if (!text || !text.trim()) {
     return { passive_aggressive: false, condescending: false, provocation: false, toxicity: 'none' };
@@ -586,7 +241,6 @@ No extra text.`
   }
 }
 
-// Enhanced moderation with intelligent responses and timeout system
 async function generateContextualCallout(message, tone, userHistory) {
   try {
     const resp = await openai.chat.completions.create({
@@ -595,62 +249,51 @@ async function generateContextualCallout(message, tone, userHistory) {
       messages: [
         {
           role: 'system',
-          content: `You're a witty Discord moderator bot for a software development community. Generate a brief, clever response to problematic behavior. Guidelines:
+          content: `You're a witty Discord moderator bot for a software dev community. Generate a brief, clever response.
 
-TONE ANALYSIS:
+TONE:
 - passive_aggressive: ${tone.passive_aggressive}
-- condescending: ${tone.condescending} 
+- condescending: ${tone.condescending}
 - provocation: ${tone.provocation}
 - toxicity: ${tone.toxicity}
 
-USER CONTEXT:
+USER:
 - Previous warnings: ${userHistory.warningCount || 0}
-- Recent behavior pattern: ${userHistory.pattern || 'first incident'}
+- Pattern: ${userHistory.pattern || 'first incident'}
 
-RESPONSE STYLE:
-- Keep it under 100 characters
-- Be witty but not mean
-- Use relevant emoji (1-2 max)
-- Tech/coding references when appropriate
-- Escalate firmness based on repeat behavior
-- If high toxicity or repeat offender, suggest they take a break
-
-Generate ONE appropriate response for this specific situation.`
+STYLE:
+- < 100 chars
+- Witty, not mean
+- 0–2 emojis max
+- Firmer for repeats
+- High toxicity: suggest a break`
         },
-        {
-          role: 'user', 
-          content: `Message: "${message}"\nGenerate appropriate callout response.`
-        }
+        { role: 'user', content: `Message: "${message}"\nGenerate one callout.` }
       ]
     });
-    
     return resp.choices[0].message.content.trim();
   } catch (e) {
     console.error('Failed to generate contextual callout:', e);
-    // Fallback to simple responses
-    if (tone.toxicity === 'high') return '🛑 That crossed a line. Let\'s keep this professional.';
-    if (tone.condescending) return '🪜 Climb down from that high horse—talk to people, not at them.';
-    if (tone.passive_aggressive) return '😏 That\'s a bit passive-aggressive, don\'t you think?';
-    if (tone.provocation) return '🧯 Chill—no need to pour fuel on the thread.';
-    return '⚠️ Let\'s keep things constructive here.';
+    if (tone.toxicity === 'high') return '🛑 That crossed a line. Take a breather.';
+    if (tone.condescending) return '🪜 Step down from the high horse—talk to people, not at them.';
+    if (tone.passive_aggressive) return '😏 Let’s skip the passive-aggressive and be direct.';
+    if (tone.provocation) return '🧯 No flamebait. Keep it constructive.';
+    return '⚠️ Keep it professional and helpful.';
   }
 }
 
 function getUserModerationHistory(userId) {
-  const existing = userModerationState.get(userId) || { 
-    warningCount: 0, 
-    lastIncident: 0, 
+  const existing = userModerationState.get(userId) || {
+    warningCount: 0,
+    lastIncident: 0,
     timeoutUntil: 0,
     pattern: 'first incident'
   };
-  
-  // Reset warning count if it's been more than 7 days since last incident
-  const daysSinceLastIncident = (Date.now() - existing.lastIncident) / (1000 * 60 * 60 * 24);
-  if (daysSinceLastIncident > 7) {
+  const days = (Date.now() - existing.lastIncident) / (1000 * 60 * 60 * 24);
+  if (days > 7) {
     existing.warningCount = 0;
     existing.pattern = 'clean slate';
   }
-  
   return existing;
 }
 
@@ -658,22 +301,16 @@ function updateModerationHistory(userId, toneIssues) {
   const history = getUserModerationHistory(userId);
   history.warningCount += 1;
   history.lastIncident = Date.now();
-  
-  // Determine pattern based on recent behavior
-  if (history.warningCount === 1) {
-    history.pattern = 'first incident';
-  } else if (history.warningCount <= 3) {
-    history.pattern = 'repeat behavior';
-  } else {
-    history.pattern = 'chronic issue';
-  }
-  
-  // Escalating timeouts for repeat offenders
+
+  if (history.warningCount === 1) history.pattern = 'first incident';
+  else if (history.warningCount <= 3) history.pattern = 'repeat behavior';
+  else history.pattern = 'chronic issue';
+
   if (toneIssues.toxicity === 'high' || history.warningCount >= 4) {
-    const timeoutMinutes = Math.min(history.warningCount * 10, 60); // Max 1 hour
+    const timeoutMinutes = Math.min(history.warningCount * 10, 60);
     history.timeoutUntil = Date.now() + (timeoutMinutes * 60 * 1000);
   }
-  
+
   userModerationState.set(userId, history);
   return history;
 }
@@ -683,19 +320,173 @@ function isUserInTimeout(userId) {
   return Date.now() < history.timeoutUntil;
 }
 
-// ---------- moderation (existing) ----------
+// ---------- ROBUST PROFILING ----------
+/**
+ * Robust, structured, *non-clinical* behavioral profiling.
+ * - Avoids medical/diagnostic claims. No protected-class inferences beyond coarse age/gender likelihood with low confidence.
+ * - Aggregates over time (EWMA) so one message doesn't dominate.
+ */
+function ewma(prev, next, alpha = 0.3) {
+  if (prev == null) return next;
+  return (1 - alpha) * prev + alpha * next;
+}
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+async function robustAnalyzeUserProfile(text, userId) {
+  if (!text || !text.trim()) return;
+
+  // 1) Ask LLM for structured analysis
+  let analysis;
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content:
+`You are a cautious behavioral analyst. Produce *non-clinical* inferences only.
+Return STRICT JSON with keys:
+- age_range: "under_18"|"18_25"|"26_35"|"35_plus"|"unknown"
+- age_confidence: number 0..1
+- gender_likely: "male"|"female"|"non_binary"|"unknown"
+- gender_confidence: number 0..1
+- interests: string[]  (max 8 topical interests inferred from message content)
+- personality_traits: string[]  (concise, non-clinical, e.g., "dry humor","direct","detail-oriented","risk-taking")
+- big5: { O:number, C:number, E:number, A:number, N:number }   // 0..1 likelihoods inferred from writing cues
+- communication_style: {
+    directness: 0..1, formality: 0..1, sarcasm: 0..1, humor: 0..1,
+    assertiveness: 0..1, empathy: 0..1, profanity: 0..1, emoji_use: 0..1
+  }
+- skill_estimates: { programming_level: "novice"|"intermediate"|"advanced"|"unknown", domains: string[] }
+- risk_flags: { trollish:0..1, brigading:0..1, spammy:0..1, conflict_prone:0..1 }
+- flirty_appropriate: boolean  // only if clearly adult + tone suggests comfort
+- confidence_overall: 0..1
+Rules:
+- Be conservative; prefer "unknown" and lower confidences if unsure.
+- Do NOT include clinical labels or diagnoses.
+- Do NOT include protected attributes (race, religion, etc.).
+- Output JSON only.`
+        },
+        { role: 'user', content: text }
+      ]
+    });
+    analysis = JSON.parse(resp.choices[0].message.content);
+  } catch (e) {
+    console.error('robustAnalyzeUserProfile: LLM failed', e);
+    return;
+  }
+
+  // 2) Load existing profile and merge (light EWMA smoothing for scores)
+  const existing = (await getUserProfile(userId)) || {};
+
+  const mergedBig5 = {
+    O: clamp01(ewma(existing.big5?.O, analysis.big5?.O ?? null)),
+    C: clamp01(ewma(existing.big5?.C, analysis.big5?.C ?? null)),
+    E: clamp01(ewma(existing.big5?.E, analysis.big5?.E ?? null)),
+    A: clamp01(ewma(existing.big5?.A, analysis.big5?.A ?? null)),
+    N: clamp01(ewma(existing.big5?.N, analysis.big5?.N ?? null)),
+  };
+
+  const mergedComm = {
+    directness: clamp01(ewma(existing.communication_style?.directness, analysis.communication_style?.directness ?? null)),
+    formality: clamp01(ewma(existing.communication_style?.formality, analysis.communication_style?.formality ?? null)),
+    sarcasm: clamp01(ewma(existing.communication_style?.sarcasm, analysis.communication_style?.sarcasm ?? null)),
+    humor: clamp01(ewma(existing.communication_style?.humor, analysis.communication_style?.humor ?? null)),
+    assertiveness: clamp01(ewma(existing.communication_style?.assertiveness, analysis.communication_style?.assertiveness ?? null)),
+    empathy: clamp01(ewma(existing.communication_style?.empathy, analysis.communication_style?.empathy ?? null)),
+    profanity: clamp01(ewma(existing.communication_style?.profanity, analysis.communication_style?.profanity ?? null)),
+    emoji_use: clamp01(ewma(existing.communication_style?.emoji_use, analysis.communication_style?.emoji_use ?? null)),
+  };
+
+  const mergedRisk = {
+    trollish: clamp01(ewma(existing.risk_flags?.trollish, analysis.risk_flags?.trollish ?? null)),
+    brigading: clamp01(ewma(existing.risk_flags?.brigading, analysis.risk_flags?.brigading ?? null)),
+    spammy: clamp01(ewma(existing.risk_flags?.spammy, analysis.risk_flags?.spammy ?? null)),
+    conflict_prone: clamp01(ewma(existing.risk_flags?.conflict_prone, analysis.risk_flags?.conflict_prone ?? null)),
+  };
+
+  const mergedInterests = Array.from(new Set([...(existing.interests || []), ...(analysis.interests || [])])).slice(0, 20);
+  const mergedTraits = Array.from(new Set([...(existing.traits || []), ...(analysis.personality_traits || [])])).slice(0, 20);
+
+  // flirty level smoothing (store as 0..1)
+  let flirtyLevel = existing.flirty_level || 0;
+  if (analysis.flirty_appropriate && (analysis.age_range === '18_25' || analysis.age_range === '26_35' || analysis.age_range === '35_plus')) {
+    flirtyLevel = clamp01(flirtyLevel + 0.1);
+  } else {
+    // gentle decay
+    flirtyLevel = clamp01(flirtyLevel * 0.98);
+  }
+
+  // 3) Persist
+  try {
+    await updateUserProfile({
+      userId,
+      // keep legacy fields so existing dashboards continue to work
+      ageRange: analysis.age_range,
+      genderLikely: analysis.gender_likely,
+      interests: mergedInterests,
+      traits: mergedTraits,
+      flirtyLevel,
+
+      // extended structured fields
+      big5: mergedBig5,
+      communication_style: mergedComm,
+      risk_flags: mergedRisk,
+      skill_estimates: analysis.skill_estimates || { programming_level: 'unknown', domains: [] },
+      age_confidence: analysis.age_confidence ?? 0,
+      gender_confidence: analysis.gender_confidence ?? 0,
+      confidence_overall: analysis.confidence_overall ?? 0,
+      last_observed_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('updateUserProfile failed:', e);
+  }
+
+  // 4) Store a memorable quirk (small, human-readable breadcrumb)
+  try {
+    const highlights = [];
+    if (mergedTraits.length) highlights.push(`Traits: ${mergedTraits.slice(0,3).join(', ')}`);
+    if (mergedInterests.length) highlights.push(`Interests: ${mergedInterests.slice(0,3).join(', ')}`);
+    if (analysis.skill_estimates?.programming_level && analysis.skill_estimates.programming_level !== 'unknown') {
+      highlights.push(`Skill: ${analysis.skill_estimates.programming_level}`);
+    }
+    if (highlights.length) await rememberUserQuirk(userId, highlights.join(' | '));
+  } catch (e) {
+    console.error('rememberUserQuirk failed:', e);
+  }
+}
+
+// ---------- moderation core ----------
 async function handleModeration(msg) {
   if (DISABLED_GUILDS.has(msg.guildId)) return;
   if (shadowBanned.has(msg.author.id)) {
     await msg.delete().catch(() => {});
     return;
   }
-  
+
+  // (Optional) store message to DB for your own convo history analytics
+  try {
+    await saveConversationMessage({
+      channelId: msg.channelId,
+      guildId: msg.guildId,
+      userId: msg.author.id,
+      role: 'user',
+      content: msg.content
+    });
+  } catch (e) {
+    // non-fatal
+  }
+
+  // basic spam window
   const history = messageHistory.get(msg.channelId) || [];
   history.push({ text: msg.content, time: Date.now(), user: msg.author.id });
   if (history.length > 10) history.shift();
   messageHistory.set(msg.channelId, history);
-  
+
+  // 5 msgs in <5s
   const userMsgs = history.filter((h) => h.user === msg.author.id);
   if (userMsgs.length >= 5 && Date.now() - userMsgs[0].time < 5000) {
     await escalate(msg, 'Spam (too many messages)');
@@ -703,14 +494,16 @@ async function handleModeration(msg) {
     await recordLog(msg, { action: 'delete' });
     return;
   }
-  
+
+  // single-message copypasta
   if (hasCopypastaInSingleMessage(msg.content)) {
     await escalate(msg, 'Spam (copypasta in single message)');
     await msg.delete().catch(() => {});
     await recordLog(msg, { action: 'delete' });
     return;
   }
-  
+
+  // repeated duplicate messages
   const normalizedBatch = userMsgs.map((h) => normalizeForRepeat(h.text));
   if (normalizedBatch.length >= 3) {
     const first = normalizedBatch[0];
@@ -721,14 +514,16 @@ async function handleModeration(msg) {
       return;
     }
   }
-  
+
+  // emoji flood
   if (countEmojis(msg.content) >= 12) {
     await escalate(msg, 'Spam (emoji flood)');
     await msg.delete().catch(() => {});
     await recordLog(msg, { action: 'delete' });
     return;
   }
-  
+
+  // OpenAI moderation categories
   const modRes = await openai.moderations.create({
     model: 'omni-moderation-latest',
     input: msg.content,
@@ -741,56 +536,53 @@ async function handleModeration(msg) {
       await escalate(msg, 'Severe hate/violence');
     }
   }
-  
-const tone = await classifyBehavior(msg.content);
 
-// Check if user is in timeout first
-if (isUserInTimeout(msg.author.id)) {
-  await msg.delete().catch(() => {});
-  return;
-}
+  // Tone analysis & witty callouts
+  const tone = await classifyBehavior(msg.content);
 
-// Check if any tone issues detected
-const hasToneIssues = tone.passive_aggressive || tone.condescending || tone.provocation || tone.toxicity !== 'none';
+  // active timeout => auto delete
+  if (isUserInTimeout(msg.author.id)) {
+    await msg.delete().catch(() => {});
+    return;
+  }
 
-if (hasToneIssues) {
-  const now = Date.now();
-  const lastReply = lastToneReply.get(msg.author.id) || 0;
-  
-  // Cooldown to prevent spam, but shorter for repeat offenders
-  const userHistory = getUserModerationHistory(msg.author.id);
-  const cooldownMs = userHistory.warningCount > 2 ? 3000 : TONE_COOLDOWN_MS;
-  
-  if (now - lastReply >= cooldownMs) {
-    // Generate intelligent, context-aware response
-    const calloutResponse = await generateContextualCallout(msg.content, tone, userHistory);
-    await msg.reply(calloutResponse);
-    lastToneReply.set(msg.author.id, now);
-    
-    // Update moderation history
-    const updatedHistory = updateModerationHistory(msg.author.id, tone);
-    
-    // Apply timeout if warranted
-    if (updatedHistory.timeoutUntil > Date.now()) {
-      const timeoutMinutes = Math.ceil((updatedHistory.timeoutUntil - Date.now()) / (1000 * 60));
-      try {
-        await msg.member.timeout(timeoutMinutes * 60 * 1000, 'Escalating behavioral issues');
-        await msg.reply(`🕐 Taking a ${timeoutMinutes}-minute break to cool down.`);
-      } catch (e) {
-        console.error('Failed to timeout user:', e);
+  const hasToneIssues =
+    tone.passive_aggressive || tone.condescending || tone.provocation || tone.toxicity !== 'none';
+
+  if (hasToneIssues) {
+    const now = Date.now();
+    const lastReply = lastToneReply.get(msg.author.id) || 0;
+
+    const userHistory = getUserModerationHistory(msg.author.id);
+    const cooldownMs = userHistory.warningCount > 2 ? 3000 : TONE_COOLDOWN_MS;
+
+    if (now - lastReply >= cooldownMs) {
+      const calloutResponse = await generateContextualCallout(msg.content, tone, userHistory);
+      await msg.reply(calloutResponse);
+      lastToneReply.set(msg.author.id, now);
+
+      // escalate history + potential timeout
+      const updated = updateModerationHistory(msg.author.id, tone);
+      if (updated.timeoutUntil > Date.now()) {
+        const timeoutMinutes = Math.ceil((updated.timeoutUntil - Date.now()) / (1000 * 60));
+        try {
+          await msg.member.timeout(timeoutMinutes * 60 * 1000, 'Escalating behavioral issues');
+          await msg.reply(`🕐 Taking a ${timeoutMinutes}-minute break to cool down.`);
+        } catch (e) {
+          console.error('Failed to timeout user:', e);
+        }
       }
     }
   }
-}
-  
+
   if (tone.toxicity === 'high' || (tone.toxicity === 'medium' && (tone.condescending || tone.provocation))) {
     await escalate(msg, `Hostile tone (${tone.toxicity})`);
   }
-  
+
   if (/stupid bot|fuck you/i.test(msg.content)) {
     await escalate(msg, 'Insulting the bot');
   }
-  
+
   await recordLog(msg, {
     harassment: !!flagged?.categories?.harassment,
     hate: !!flagged?.categories?.hate,
@@ -803,7 +595,15 @@ if (hasToneIssues) {
     },
     action: 'none'
   });
-  
+
+  // Lightweight profiling (AFTER moderation so failures don't block mod)
+  try {
+    await robustAnalyzeUserProfile(msg.content, msg.author.id);
+  } catch (e) {
+    console.error('profiling pipeline error (non-fatal):', e);
+  }
+
+  // Placeholder: image evidence
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
       await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
@@ -811,100 +611,7 @@ if (hasToneIssues) {
   }
 }
 
-// ---------- enhanced conversation with database memory ----------
-async function chatWithAI(text, userId, channelId) {
-  const quirks = await getUserQuirks(userId);
-  const personalityMod = await getPersonalityModifier(userId);
-  const conversationContext = await getConversationContext(channelId);
-  
-  const systemPrompt = `
-You are "${persona.display_name}" (${persona.pronouns}).
-Style: ${persona.style}.
-Be witty, playful, and socially aware.
-${personalityMod}
-${quirks.length ? `This user's quirks: ${quirks.join('; ')}` : ''}
-Use conversation context naturally but don't reference it explicitly unless relevant.
-  `.trim();
-  
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...conversationContext,
-    { role: 'user', content: text }
-  ];
-  
-  const resp = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: messages,
-  });
-  
-  return resp.choices[0].message.content.trim();
-}
-
-async function handleConversation(msg) {
-  const channelId = msg.channel.id;
-  
-  // Update database activity tracking
-  await updateChannelActivity(channelId, msg.guildId);
-  
-  // Save user message to database
-  await saveConversationMessage({
-    channelId: msg.channelId,
-    guildId: msg.guildId,
-    userId: msg.author.id,
-    role: 'user',
-    content: msg.content
-  });
-  
-  // Analyze user for profiling
-  await analyzeUserProfile(msg.content, msg.author.id);
-  
-  if (activeConvos.get(channelId) === 'off') return;
-  
-  let reply = null;
-  
-  if (/(mac|windows|linux)/i.test(msg.content)) {
-    if (!activeConvos.has(channelId)) {
-      activeConvos.set(channelId, 'pending');
-      reply = '💻 Want me to join this debate? (yes/no)';
-      await msg.reply(reply);
-      await rememberUserQuirk(msg.author.id, 'Started an OS debate');
-    } else if (activeConvos.get(channelId) === 'on') {
-      reply = await chatWithAI(msg.content, msg.author.id, channelId);
-      await msg.reply(reply);
-    }
-  }
-  
-  if (/stop yapping|no\b/i.test(msg.content.toLowerCase())) {
-    activeConvos.set(channelId, 'off');
-    reply = "🤐 Okay, I'll stay out."; // changed it to ""
-    await msg.reply(reply);
-  }
-  
-  if (/yes|be part/i.test(msg.content.toLowerCase())) {
-    activeConvos.set(channelId, 'on');
-    reply = "😎 Cool, I'm in.";// changed it to ""
-    await msg.reply(reply);
-  }
-  
-  // Direct mentions or questions
-  if (msg.mentions.has(client.user) || /^(hey|hi|hello).*kmwyl/i.test(msg.content)) {
-    reply = await chatWithAI(msg.content, msg.author.id, channelId);
-    await msg.reply(reply);
-  }
-  
-  // Save bot reply to database if we replied
-  if (reply) {
-    await saveConversationMessage({
-      channelId: msg.channelId,
-      guildId: msg.guildId,
-      userId: null, // Bot message
-      role: 'assistant',
-      content: reply
-    });
-  }
-}
-
-// ---------- auto threads (existing) ----------
+// ---------- optional: auto-threads for long replies (kept ON) ----------
 async function handleAutoThreads(msg) {
   if (!msg.reference) return;
   const refMsg = await msg.fetchReference().catch(() => null);
@@ -920,7 +627,7 @@ async function handleAutoThreads(msg) {
   }
 }
 
-// ---------- voting enforcement (existing) ----------
+// ---------- community voting enforcement ----------
 client.on(Events.MessageReactionAdd, async (reaction) => {
   if (reaction.emoji.name !== '🚫') return;
   const msg = reaction.message;
@@ -933,7 +640,7 @@ client.on(Events.MessageReactionAdd, async (reaction) => {
   }
 });
 
-// ---------- anti-raid (existing) ----------
+// ---------- anti-raid ----------
 client.on(Events.GuildMemberAdd, (member) => {
   recentJoins.push(Date.now());
   while (recentJoins.length && Date.now() - recentJoins[0] > 60000) {
@@ -950,13 +657,12 @@ client.on(Events.GuildMemberAdd, (member) => {
   }
 });
 
-// ---------- admin + SUS commands (existing + new) ----------
+// ---------- admin commands ----------
 client.on(Events.MessageCreate, async (msg) => {
   if (!msg.guild || msg.author.bot) return;
   const isOwner = msg.author.id === OWNER_ID;
-  
+
   if (isOwner) {
-    // Existing admin commands...
     if (msg.content.startsWith('!forgive')) {
       const target = msg.mentions.users.first();
       if (target) {
@@ -964,17 +670,17 @@ client.on(Events.MessageCreate, async (msg) => {
         await msg.reply(`🙏 Forgiven ${target.username}.`);
       }
     }
-    
+
     if (msg.content === '!disablemod') {
       DISABLED_GUILDS.add(msg.guildId);
       await msg.reply('🚫 Moderator disabled here.');
     }
-    
+
     if (msg.content === '!enablemod') {
       DISABLED_GUILDS.delete(msg.guildId);
       await msg.reply('✅ Moderator enabled here.');
     }
-    
+
     if (msg.content.startsWith('!shadowban')) {
       const target = msg.mentions.users.first();
       if (target) {
@@ -982,7 +688,7 @@ client.on(Events.MessageCreate, async (msg) => {
         await msg.reply(`👻 Shadowbanned ${target.username}.`);
       }
     }
-    
+
     if (msg.content.startsWith('!unshadowban')) {
       const target = msg.mentions.users.first();
       if (target) {
@@ -991,80 +697,63 @@ client.on(Events.MessageCreate, async (msg) => {
       }
     }
 
-    // New: Moderation status check
-if (msg.content.startsWith('!modstatus')) {
-  const target = msg.mentions.users.first();
-  if (target) {
-    const history = getUserModerationHistory(target.id);
-    const isInTimeout = isUserInTimeout(target.id);
-    const timeoutRemaining = isInTimeout ? 
-      Math.ceil((history.timeoutUntil - Date.now()) / (1000 * 60)) : 0;
-    
-    await msg.reply(
-      `📊 Moderation status for <@${target.id}>:\n` +
-      `• Warning count: ${history.warningCount}\n` +
-      `• Pattern: ${history.pattern}\n` +
-      `• In timeout: ${isInTimeout ? `Yes (${timeoutRemaining}m remaining)` : 'No'}\n` +
-      `• Last incident: ${history.lastIncident ? new Date(history.lastIncident).toLocaleDateString() : 'Never'}`
-    );
-  }
-}
-
-    
-    // New: User profile inspection
+    // Enhanced profile inspection (pretty view)
     if (msg.content.startsWith('!profile')) {
       const target = msg.mentions.users.first();
       if (target) {
-        const profile = await getUserProfile(target.id);
-        if (profile) {
+        const p = await getUserProfile(target.id);
+        if (p) {
+          const big = p.big5 ? `O:${(p.big5.O??0).toFixed(2)} C:${(p.big5.C??0).toFixed(2)} E:${(p.big5.E??0).toFixed(2)} A:${(p.big5.A??0).toFixed(2)} N:${(p.big5.N??0).toFixed(2)}` : 'n/a';
+          const comm = p.communication_style ? [
+            `direct:${(p.communication_style.directness??0).toFixed(2)}`,
+            `sarcasm:${(p.communication_style.sarcasm??0).toFixed(2)}`,
+            `humor:${(p.communication_style.humor??0).toFixed(2)}`,
+            `assert:${(p.communication_style.assertiveness??0).toFixed(2)}`,
+          ].join(' • ') : 'n/a';
+          const risk = p.risk_flags ? [
+            `troll:${(p.risk_flags.trollish??0).toFixed(2)}`,
+            `brigade:${(p.risk_flags.brigading??0).toFixed(2)}`,
+            `spam:${(p.risk_flags.spammy??0).toFixed(2)}`,
+            `conflict:${(p.risk_flags.conflict_prone??0).toFixed(2)}`,
+          ].join(' • ') : 'n/a';
+          const skill = p.skill_estimates?.programming_level || 'unknown';
           await msg.reply(
             `👤 Profile for <@${target.id}>:\n` +
-            `• Age range: ${profile.age_range || 'unknown'}\n` +
-            `• Gender likely: ${profile.gender_likely || 'unknown'}\n` +
-            `• Flirty level: ${Math.round((profile.flirty_level || 0) * 10)}/10\n` +
-            `• Interests: ${(profile.interests || []).slice(0, 5).join(', ') || 'none detected'}\n` +
-            `• Traits: ${(profile.traits || []).slice(0, 5).join(', ') || 'none detected'}`
+            `• Age: ${p.age_range || 'unknown'} (${((p.age_confidence??0)*100).toFixed(0)}% conf)\n` +
+            `• Gender: ${p.gender_likely || 'unknown'} (${((p.gender_confidence??0)*100).toFixed(0)}% conf)\n` +
+            `• Big5: ${big}\n` +
+            `• Comms: ${comm}\n` +
+            `• Risk: ${risk}\n` +
+            `• Skill: ${skill}\n` +
+            `• Interests: ${(p.interests||[]).slice(0,6).join(', ') || '—'}\n` +
+            `• Traits: ${(p.traits||[]).slice(0,6).join(', ') || '—'}\n` +
+            `• Flirty level: ${Math.round((p.flirty_level||0)*10)}/10\n` +
+            `• Confidence overall: ${((p.confidence_overall??0)*100).toFixed(0)}%\n` +
+            `• Last observed: ${p.last_observed_at || '—'}\n` +
+            `_Note: heuristic, non-clinical signals only._`
           );
         } else {
           await msg.reply(`No profile data for <@${target.id}> yet.`);
         }
       }
     }
-    
-    // New: Force conversation starter
-   if (msg.content === '!starter') {
-  const config = CHANNEL_CONFIG[msg.channelId];
-  if (!config) return msg.reply("⚠️ This channel doesn't support starters.");
 
-  const starter = await getStarterForChannel(msg.channelId);
-  if (!starter) return;
+    // Raw JSON (owner-only; dev/debug)
+    if (msg.content.startsWith('!profilejson')) {
+      const target = msg.mentions.users.first();
+      if (target) {
+        const p = await getUserProfile(target.id);
+        await msg.reply('```json\n' + JSON.stringify(p || {}, null, 2) + '\n```');
+      }
+    }
 
-  await msg.channel.send(starter);
-
-  // Update database tracking
-  await updateChannelActivity(msg.channelId, msg.guildId);
-  await recordAutoStarter(msg.channelId);
-
-  // Save to conversation history
-  await saveConversationMessage({
-    channelId: msg.channelId,
-    guildId: msg.guildId,
-    userId: null,
-    role: 'assistant',
-    content: starter
-  });
-
-  await msg.reply('🚀 Conversation starter deployed!');
-}
-
-    
-    // New: Run database cleanup
+    // Run DB cleanup
     if (msg.content === '!cleanup') {
       await runDailyCleanup();
       await msg.reply('🧹 Database cleanup completed!');
     }
-    
-    // Existing SUS commands...
+
+    // SUS reports
     if (msg.content.startsWith('!sus ')) {
       const m = msg.content.split(/\s+/);
       const target = msg.mentions.users.first();
@@ -1081,7 +770,7 @@ if (msg.content.startsWith('!modstatus')) {
       );
       return;
     }
-    
+
     if (msg.content.startsWith('!susrecent')) {
       const parts = msg.content.split(/\s+/);
       const hours = Number(parts[1]) || 24;
@@ -1095,7 +784,7 @@ if (msg.content.startsWith('!modstatus')) {
       await msg.reply(`🧾 Recent incidents (last ${hours}h):\n${lines.join('\n')}`);
       return;
     }
-    
+
     if (msg.content.startsWith('!suswho')) {
       const parts = msg.content.split(/\s+/);
       const hours = Number(parts[1]) || 24;
@@ -1109,43 +798,31 @@ if (msg.content.startsWith('!modstatus')) {
       return;
     }
   }
-  
+
+  // ALWAYS run moderation & auto-threads (chatting is OFF)
   await handleModeration(msg);
-  await handleConversation(msg);
   await handleAutoThreads(msg);
 });
 
-// ---------- startup & auto-starter loop ----------
+// ---------- startup ----------
 client.once(Events.ClientReady, () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  
-  // Set up auto-starter interval (check every 30 minutes)
-  setInterval(checkAndSendAutoStarter, 30 * 60 * 1000);
-  
-  // Set up daily cleanup (run at 3 AM)
+
+  // Daily cleanup at ~3 AM server time
   const scheduleCleanup = () => {
     const now = new Date();
     const tomorrow = new Date(now);
     tomorrow.setDate(now.getDate() + 1);
-    tomorrow.setHours(3, 0, 0, 0); // 3 AM
-    
-    const msUntilCleanup = tomorrow.getTime() - now.getTime();
+    tomorrow.setHours(3, 0, 0, 0);
+    const ms = tomorrow.getTime() - now.getTime();
     setTimeout(() => {
       runDailyCleanup();
-      setInterval(runDailyCleanup, 24 * 60 * 60 * 1000); // Then every 24 hours
-    }, msUntilCleanup);
+      setInterval(runDailyCleanup, 24 * 60 * 60 * 1000);
+    }, ms);
   };
   scheduleCleanup();
-  
-  // Initialize activity tracking for existing channels
-  client.guilds.cache.forEach(guild => {
-    guild.channels.cache
-      .filter(channel => channel.type === 0) // Text channels only
-      .forEach(async channel => {
-        await updateChannelActivity(channel.id, guild.id);
-      });
-  });
+
+  // IMPORTANT: No auto-starter interval. No conversation join prompts. No mention-based chatting.
 });
 
 client.login(process.env.DISCORD_TOKEN);
-
