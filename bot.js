@@ -9,6 +9,7 @@ import {
   PermissionsBitField,
 } from 'discord.js';
 import OpenAI from 'openai';
+import fs from 'node:fs/promises'; // <-- added for DM storage
 
 // --- db funcs used for moderation + profiling + reports ---
 import {
@@ -54,6 +55,30 @@ const TONE_COOLDOWN_MS = 5000;
 
 // escalating timeouts
 const userModerationState = new Map(); // userId -> { warningCount, lastIncident, timeoutUntil, pattern }
+
+// ---------- ONE-TIME DM BROADCAST (display-name personalization) ----------
+const DM_ONCE_PATH = './data/dm_once.json';
+let dmOnceStore = { guilds: {} };
+
+async function loadDmOnce() {
+  try {
+    await fs.mkdir('./data', { recursive: true });
+    const raw = await fs.readFile(DM_ONCE_PATH, 'utf8').catch(() => '{}');
+    const parsed = JSON.parse(raw || '{}');
+    dmOnceStore = { guilds: parsed.guilds || {} };
+  } catch (e) { console.error('loadDmOnce failed:', e); }
+}
+async function saveDmOnce() {
+  try { await fs.writeFile(DM_ONCE_PATH, JSON.stringify(dmOnceStore, null, 2), 'utf8'); }
+  catch (e) { console.error('saveDmOnce failed:', e); }
+}
+function alreadySentOnce(guildId, userId) {
+  return Boolean(dmOnceStore.guilds?.[guildId]?.sentTo?.[userId]);
+}
+function markSentOnce(guildId, userId) {
+  if (!dmOnceStore.guilds[guildId]) dmOnceStore.guilds[guildId] = { sentTo: {}, runs: [] };
+  dmOnceStore.guilds[guildId].sentTo[userId] = Date.now();
+}
 
 // ---------- helpers ----------
 function decayStrikes(userId) {
@@ -330,7 +355,6 @@ function ewma(prev, next, alpha = 0.3) {
   if (prev == null) return next;
   return (1 - alpha) * prev + alpha * next;
 }
-
 function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
 async function robustAnalyzeUserProfile(text, userId) {
@@ -747,6 +771,72 @@ client.on(Events.MessageCreate, async (msg) => {
       }
     }
 
+    // --- ONE-TIME DM EVERYONE (display-name personalization) ---
+    // Usage: !dmallonce Your message here with {display} and {server}
+    if (msg.content.startsWith('!dmallonce ')) {
+      const baseMsg = msg.content.replace(/^!dmallonce\s+/, '').trim();
+      if (!baseMsg) return msg.reply('Usage: `!dmallonce <message>`');
+
+      await msg.reply('🕊️ Starting one-time DM broadcast. I’ll go slow to respect limits.');
+
+      // Ensure full member list
+      const members = await msg.guild.members.fetch().catch(() => null);
+      if (!members) return msg.reply('❌ Could not fetch members.');
+
+      const humans = members.filter(m => !m.user.bot);
+      const results = { attempted: 0, sent: 0, skipped_existing: 0, failed: 0, cannot_dm: 0 };
+
+      for (const m of humans.values()) {
+        // skip if already sent previously
+        if (alreadySentOnce(msg.guildId, m.user.id)) {
+          results.skipped_existing++;
+          continue;
+        }
+
+        // Personalize with display name (nickname if set, else global/username)
+        const display = m.displayName || m.user.globalName || m.user.username;
+        const personalized = baseMsg
+          .replaceAll('{display}', display)
+          .replaceAll('{server}', msg.guild.name);
+
+        try {
+          await m.send(personalized + '\n\n—\n(This is a one-time personal invite from the server admin.)');
+          markSentOnce(msg.guildId, m.user.id);
+          results.sent++;
+        } catch (e) {
+          results.failed++;
+          if (e?.code === 50007) results.cannot_dm++; // user has DMs closed or blocked bot
+        }
+
+        results.attempted++;
+        if (results.attempted % 25 === 0) {
+          await msg.channel.send(`Progress: sent ${results.sent}, failed ${results.failed}, skipped ${results.skipped_existing}…`);
+        }
+
+        // gentle pacing to avoid spikes
+        await new Promise(r => setTimeout(r, 1100));
+      }
+
+      // record run
+      if (!dmOnceStore.guilds[msg.guildId]) dmOnceStore.guilds[msg.guildId] = { sentTo: {}, runs: [] };
+      dmOnceStore.guilds[msg.guildId].runs.push({ at: Date.now(), results });
+      await saveDmOnce();
+
+      const summary =
+        `✅ Done.\n• Sent: ${results.sent}\n• Failed: ${results.failed} (closed DMs: ${results.cannot_dm})\n• Skipped (already sent): ${results.skipped_existing}`;
+      await msg.reply(summary);
+      return;
+    }
+
+    // Reset the "already sent" map for this guild (use sparingly)
+    // Usage: !dmallreset
+    if (msg.content === '!dmallreset') {
+      dmOnceStore.guilds[msg.guildId] = { sentTo: {}, runs: [] };
+      await saveDmOnce();
+      await msg.reply('♻️ Reset done. The bot will treat everyone as not-yet-messaged.');
+      return;
+    }
+
     // Run DB cleanup
     if (msg.content === '!cleanup') {
       await runDailyCleanup();
@@ -805,8 +895,11 @@ client.on(Events.MessageCreate, async (msg) => {
 });
 
 // ---------- startup ----------
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+
+  // load DM store after login
+  await loadDmOnce();
 
   // Daily cleanup at ~3 AM server time
   const scheduleCleanup = () => {
