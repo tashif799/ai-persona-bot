@@ -9,7 +9,7 @@ import {
   PermissionsBitField,
 } from 'discord.js';
 import OpenAI from 'openai';
-import fs from 'node:fs/promises'; // <-- added for DM storage
+import fs from 'node:fs/promises'; // added for DM storage
 
 // --- db funcs used for moderation + profiling + reports ---
 import {
@@ -56,7 +56,7 @@ const TONE_COOLDOWN_MS = 5000;
 // escalating timeouts
 const userModerationState = new Map(); // userId -> { warningCount, lastIncident, timeoutUntil, pattern }
 
-// ---------- ONE-TIME DM BROADCAST (display-name personalization) ----------
+// ---------- ONE-TIME DM BROADCAST (display-name personalization, silent) ----------
 const DM_ONCE_PATH = './data/dm_once.json';
 let dmOnceStore = { guilds: {} };
 
@@ -346,11 +346,6 @@ function isUserInTimeout(userId) {
 }
 
 // ---------- ROBUST PROFILING ----------
-/**
- * Robust, structured, *non-clinical* behavioral profiling.
- * - Avoids medical/diagnostic claims. No protected-class inferences beyond coarse age/gender likelihood with low confidence.
- * - Aggregates over time (EWMA) so one message doesn't dominate.
- */
 function ewma(prev, next, alpha = 0.3) {
   if (prev == null) return next;
   return (1 - alpha) * prev + alpha * next;
@@ -386,7 +381,7 @@ Return STRICT JSON with keys:
   }
 - skill_estimates: { programming_level: "novice"|"intermediate"|"advanced"|"unknown", domains: string[] }
 - risk_flags: { trollish:0..1, brigading:0..1, spammy:0..1, conflict_prone:0..1 }
-- flirty_appropriate: boolean  // only if clearly adult + tone suggests comfort
+- flirty_appropriate: boolean
 - confidence_overall: 0..1
 Rules:
 - Be conservative; prefer "unknown" and lower confidences if unsure.
@@ -440,7 +435,6 @@ Rules:
   if (analysis.flirty_appropriate && (analysis.age_range === '18_25' || analysis.age_range === '26_35' || analysis.age_range === '35_plus')) {
     flirtyLevel = clamp01(flirtyLevel + 0.1);
   } else {
-    // gentle decay
     flirtyLevel = clamp01(flirtyLevel * 0.98);
   }
 
@@ -448,14 +442,11 @@ Rules:
   try {
     await updateUserProfile({
       userId,
-      // keep legacy fields so existing dashboards continue to work
       ageRange: analysis.age_range,
       genderLikely: analysis.gender_likely,
       interests: mergedInterests,
       traits: mergedTraits,
       flirtyLevel,
-
-      // extended structured fields
       big5: mergedBig5,
       communication_style: mergedComm,
       risk_flags: mergedRisk,
@@ -469,7 +460,7 @@ Rules:
     console.error('updateUserProfile failed:', e);
   }
 
-  // 4) Store a memorable quirk (small, human-readable breadcrumb)
+  // 4) Store a memorable quirk
   try {
     const highlights = [];
     if (mergedTraits.length) highlights.push(`Traits: ${mergedTraits.slice(0,3).join(', ')}`);
@@ -491,7 +482,6 @@ async function handleModeration(msg) {
     return;
   }
 
-  // (Optional) store message to DB for your own convo history analytics
   try {
     await saveConversationMessage({
       channelId: msg.channelId,
@@ -500,17 +490,13 @@ async function handleModeration(msg) {
       role: 'user',
       content: msg.content
     });
-  } catch (e) {
-    // non-fatal
-  }
+  } catch (e) { /* non-fatal */ }
 
-  // basic spam window
   const history = messageHistory.get(msg.channelId) || [];
   history.push({ text: msg.content, time: Date.now(), user: msg.author.id });
   if (history.length > 10) history.shift();
   messageHistory.set(msg.channelId, history);
 
-  // 5 msgs in <5s
   const userMsgs = history.filter((h) => h.user === msg.author.id);
   if (userMsgs.length >= 5 && Date.now() - userMsgs[0].time < 5000) {
     await escalate(msg, 'Spam (too many messages)');
@@ -519,7 +505,6 @@ async function handleModeration(msg) {
     return;
   }
 
-  // single-message copypasta
   if (hasCopypastaInSingleMessage(msg.content)) {
     await escalate(msg, 'Spam (copypasta in single message)');
     await msg.delete().catch(() => {});
@@ -527,7 +512,6 @@ async function handleModeration(msg) {
     return;
   }
 
-  // repeated duplicate messages
   const normalizedBatch = userMsgs.map((h) => normalizeForRepeat(h.text));
   if (normalizedBatch.length >= 3) {
     const first = normalizedBatch[0];
@@ -539,7 +523,6 @@ async function handleModeration(msg) {
     }
   }
 
-  // emoji flood
   if (countEmojis(msg.content) >= 12) {
     await escalate(msg, 'Spam (emoji flood)');
     await msg.delete().catch(() => {});
@@ -547,7 +530,6 @@ async function handleModeration(msg) {
     return;
   }
 
-  // OpenAI moderation categories
   const modRes = await openai.moderations.create({
     model: 'omni-moderation-latest',
     input: msg.content,
@@ -561,10 +543,8 @@ async function handleModeration(msg) {
     }
   }
 
-  // Tone analysis & witty callouts
   const tone = await classifyBehavior(msg.content);
 
-  // active timeout => auto delete
   if (isUserInTimeout(msg.author.id)) {
     await msg.delete().catch(() => {});
     return;
@@ -585,7 +565,6 @@ async function handleModeration(msg) {
       await msg.reply(calloutResponse);
       lastToneReply.set(msg.author.id, now);
 
-      // escalate history + potential timeout
       const updated = updateModerationHistory(msg.author.id, tone);
       if (updated.timeoutUntil > Date.now()) {
         const timeoutMinutes = Math.ceil((updated.timeoutUntil - Date.now()) / (1000 * 60));
@@ -620,14 +599,10 @@ async function handleModeration(msg) {
     action: 'none'
   });
 
-  // Lightweight profiling (AFTER moderation so failures don't block mod)
   try {
     await robustAnalyzeUserProfile(msg.content, msg.author.id);
-  } catch (e) {
-    console.error('profiling pipeline error (non-fatal):', e);
-  }
+  } catch (e) { console.error('profiling pipeline error (non-fatal):', e); }
 
-  // Placeholder: image evidence
   for (const att of msg.attachments.values()) {
     if (att.contentType?.startsWith('image/')) {
       await logEvidence(msg.guild, msg, 'Image posted (placeholder check)', 'ImageLog');
@@ -635,7 +610,7 @@ async function handleModeration(msg) {
   }
 }
 
-// ---------- optional: auto-threads for long replies (kept ON) ----------
+// ---------- auto-threads for long replies (kept ON) ----------
 async function handleAutoThreads(msg) {
   if (!msg.reference) return;
   const refMsg = await msg.fetchReference().catch(() => null);
@@ -771,29 +746,35 @@ client.on(Events.MessageCreate, async (msg) => {
       }
     }
 
-    // --- ONE-TIME DM EVERYONE (display-name personalization) ---
-    // Usage: !dmallonce Your message here with {display} and {server}
+    // --- ONE-TIME DM EVERYONE (display-name personalization, SILENT) ---
+    // Usage (multi-line ok): !dmallonce Your message with {display} and {server}
     if (msg.content.startsWith('!dmallonce ')) {
       const baseMsg = msg.content.replace(/^!dmallonce\s+/, '').trim();
-      if (!baseMsg) return msg.reply('Usage: `!dmallonce <message>`');
+      if (!baseMsg) return;
 
-      await msg.reply('🕊️ Starting one-time DM broadcast. I’ll go slow to respect limits.');
+      // delete trigger so nothing appears in-channel
+      try {
+        if (msg.guild.members.me?.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+          await msg.delete().catch(() => {});
+        }
+      } catch {}
 
-      // Ensure full member list
+      // DM the owner (you) with status, never post in channel
+      const notify = async (text) => {
+        try { await msg.author.send(text); } catch { /* stay silent if DM closed */ }
+      };
+
+      await notify('🕊️ Starting one-time DM broadcast. Updates will be DM’d here.');
+
       const members = await msg.guild.members.fetch().catch(() => null);
-      if (!members) return msg.reply('❌ Could not fetch members.');
+      if (!members) { await notify('❌ Could not fetch members.'); return; }
 
       const humans = members.filter(m => !m.user.bot);
-      const results = { attempted: 0, sent: 0, skipped_existing: 0, failed: 0, cannot_dm: 0 };
+      let attempted = 0, sent = 0, skipped = 0, failed = 0, cannotDM = 0;
 
       for (const m of humans.values()) {
-        // skip if already sent previously
-        if (alreadySentOnce(msg.guildId, m.user.id)) {
-          results.skipped_existing++;
-          continue;
-        }
+        if (alreadySentOnce(msg.guildId, m.user.id)) { skipped++; continue; }
 
-        // Personalize with display name (nickname if set, else global/username)
         const display = m.displayName || m.user.globalName || m.user.username;
         const personalized = baseMsg
           .replaceAll('{display}', display)
@@ -802,38 +783,39 @@ client.on(Events.MessageCreate, async (msg) => {
         try {
           await m.send(personalized + '\n\n—\n(This is a one-time personal invite from the server admin.)');
           markSentOnce(msg.guildId, m.user.id);
-          results.sent++;
+          sent++;
         } catch (e) {
-          results.failed++;
-          if (e?.code === 50007) results.cannot_dm++; // user has DMs closed or blocked bot
+          failed++;
+          if (e?.code === 50007) cannotDM++;
         }
 
-        results.attempted++;
-        if (results.attempted % 25 === 0) {
-          await msg.channel.send(`Progress: sent ${results.sent}, failed ${results.failed}, skipped ${results.skipped_existing}…`);
+        attempted++;
+        if (attempted % 25 === 0) {
+          await notify(`Progress: sent ${sent}, failed ${failed}, skipped ${skipped}…`);
         }
-
-        // gentle pacing to avoid spikes
-        await new Promise(r => setTimeout(r, 1100));
+        await new Promise(r => setTimeout(r, 1100)); // gentle pacing
       }
 
-      // record run
       if (!dmOnceStore.guilds[msg.guildId]) dmOnceStore.guilds[msg.guildId] = { sentTo: {}, runs: [] };
-      dmOnceStore.guilds[msg.guildId].runs.push({ at: Date.now(), results });
+      dmOnceStore.guilds[msg.guildId].runs.push({ at: Date.now(), results: { attempted, sent, skipped_existing: skipped, failed, cannot_dm: cannotDM } });
       await saveDmOnce();
 
-      const summary =
-        `✅ Done.\n• Sent: ${results.sent}\n• Failed: ${results.failed} (closed DMs: ${results.cannot_dm})\n• Skipped (already sent): ${results.skipped_existing}`;
-      await msg.reply(summary);
+      await notify(`✅ Done.\n• Sent: ${sent}\n• Failed: ${failed} (closed DMs: ${cannotDM})\n• Skipped (already sent): ${skipped}`);
       return;
     }
 
-    // Reset the "already sent" map for this guild (use sparingly)
-    // Usage: !dmallreset
+    // Reset "already sent" map (silent)
     if (msg.content === '!dmallreset') {
+      // delete trigger to keep silent
+      try {
+        if (msg.guild.members.me?.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+          await msg.delete().catch(() => {});
+        }
+      } catch {}
+
       dmOnceStore.guilds[msg.guildId] = { sentTo: {}, runs: [] };
       await saveDmOnce();
-      await msg.reply('♻️ Reset done. The bot will treat everyone as not-yet-messaged.');
+      try { await msg.author.send('♻️ Reset done. The bot will treat everyone as not-yet-messaged.'); } catch {}
       return;
     }
 
